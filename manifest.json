@@ -1,0 +1,21 @@
+{
+  "manifest_version": 3,
+  "name": "ABW Auto Purchase",
+  "version": "1.0.7",
+  "description": "AsianBeautyWholesale 自动加购 — 上传采购Excel一键逐条加购到购物车",
+  "icons": {
+    "16": "icon16.png",
+    "48": "icon48.png",
+    "128": "icon128.png"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://www.asianbeautywholesale.com/*"],
+      "js": ["xlsx.full.min.js", "content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "host_permissions": [
+    "https://www.asianbeautywholesale.com/*"
+  ]
+}

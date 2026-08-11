@@ -1,0 +1,15 @@
+{
+  "name": "abw-extension",
+  "version": "1.0.0",
+  "private": true,
+  "description": "浏览器扩展项目",
+  "scripts": {
+    "prepare": "husky",
+    "commit": "cz"
+  },
+  "devDependencies": {
+    "@commitlint/cli": "^19.5.0",
+    "@commitlint/config-conventional": "^19.5.0",
+    "husky": "^9.1.6"
+  }
+}
