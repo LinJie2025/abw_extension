@@ -44,6 +44,20 @@
   };
 
   // ============================================================
+  //  错误码常量（集中管理，扩展只需在此加一行）
+  // ============================================================
+  const ERRORS = {
+    NO_SKU:          '无SKU，需人工加购',
+    UNSUPPORTED_TYPE:'暂未支持该加购类型，需人工加购',
+    OUT_OF_STOCK:    '缺货',
+    PAGE_TIMEOUT:    '页面加载超时，需人工加购',
+    CF_TIMEOUT:      'Cloudflare验证超时，需人工加购',
+  };
+
+  // 未知错误前缀（与 ERRORS 区分，Excel 中标记为开发排查类）
+  const UNKNOWN_ERR = '未知错误';
+
+  // ============================================================
   //  跨页面持久化（页面跳转刷新后面板/日志/任务全部恢复）
   // ============================================================
   const STORE = {
@@ -406,12 +420,14 @@
         innerRef: String(row[colIdx.innerRef] || '').trim(),
         packaging: String(row[colIdx.packaging] || '').trim(),
         quantity: parseInt(row[colIdx.quantity]) || 1,
+        _noSku: false, // 标记无 SKU 的行
       };
 
-      // 过滤掉没有 Box SKU 的行
-      if (item.boxSku && item.boxSku !== '-') {
-        items.push(item);
+      // 无 boxSku 的行保留但标记，运行时直接跳过
+      if (!item.boxSku || item.boxSku === '-') {
+        item._noSku = true;
       }
+      items.push(item);
     }
 
     console.log('[ABW] Excel 解析结果:', { headers, colIdx, itemCount: items.length, sample: items[0] });
@@ -452,11 +468,16 @@
     log(`  → 点击加购...`, 'info');
     addBtn.click();
     await sleep(1000);
-    // Step 7: 等待弹窗并校验
+    // Step 7: 检测是否弹出 "Select size or color" 弹窗（需人工选择规格）
+    if (isSelectSizeDialogOpen()) {
+      log(`  ⚠️ 检测到 "Select size or color" 弹窗，暂未支持该加购类型`, 'warn');
+      return { status: 'failed', item, reason: ERRORS.UNSUPPORTED_TYPE };
+    }
+    // Step 8: 等待弹窗并校验
     log(`  → 等待加购结果...`, 'info');
     const success = await waitForSuccessModal();
     if (!success) throw new Error('超时未检测到加购成功弹窗');
-    // Step 8: 关闭弹窗
+    // Step 9: 关闭弹窗
     await closeModal();
     await randomDelay();
     log(`  ✅ 加购成功!`, 'success');
@@ -467,6 +488,12 @@
   async function executeItem(item, attempt = 1) {
     const { boxSku, innerRef, packaging, quantity, _row } = item;
     const addQty = quantity;
+
+    // 无 Box SKU → 直接标记失败
+    if (item._noSku) {
+      log(`📦 第${_row}行: 无SKU，需人工加购`, 'warn');
+      return { status: 'failed', item, reason: ERRORS.NO_SKU };
+    }
 
     log(`📦 第${_row}行: SKU=${boxSku} | 规格=${packaging} | 数量=${addQty} | 第${attempt}次尝试`, 'action');
 
@@ -486,11 +513,11 @@
         if (ready.reason === 'no_button') {
           // DOM 已稳定但无加购按钮 → 缺货
           log(`  ⚠️ 页面已加载但无加购按钮，判定缺货`, 'warn');
-          return { status: 'skipped', item, reason: '缺货' };
+          return { status: 'skipped', item, reason: ERRORS.OUT_OF_STOCK };
         }
         // DOM 未稳定 → 真正的加载超时
         log(`  ⚠️ 商品页加载超时（DOM 未稳定），跳过`, 'warn');
-        return { status: 'failed', item, reason: '页面加载超时' };
+        return { status: 'failed', item, reason: ERRORS.PAGE_TIMEOUT };
       }
 
       // ---- Cloudflare 安全验证检测 ----
@@ -513,7 +540,7 @@
       }
       if (cfRetries >= cfMaxRetries) {
         log(`  ❌ Cloudflare 验证未通过，跳过此商品`, 'error');
-        return { status: 'failed', item, reason: 'Cloudflare验证超时' };
+        return { status: 'failed', item, reason: ERRORS.CF_TIMEOUT };
       }
 
       // 提取商品英文名
@@ -524,7 +551,7 @@
       const addBtn = await findAddToBagButton();
       if (!addBtn) {
         log(`  ⚠️ 无加购按钮（缺货），跳过`, 'warn');
-        return { status: 'skipped', item, reason: '缺货' };
+        return { status: 'skipped', item, reason: ERRORS.OUT_OF_STOCK };
       }
 
       // ---- Step 3: 校验 UPC ----
@@ -559,7 +586,7 @@
         await randomDelay();
         return executeItem(item, attempt + 1);
       }
-      return { status: 'failed', item, error: err.message };
+      return { status: 'failed', item, reason: UNKNOWN_ERR, error: `[Row${_row}|${boxSku}] ${err.message}` };
     }
   }
 
@@ -628,6 +655,17 @@
         if (/added.*shopping\s*bag/i.test(overlayText)) return true;
       }
       await sleep(500);
+    }
+    return false;
+  }
+
+  // 检测是否弹出 "Select size or color" 弹窗（商品需人工选择规格）
+  function isSelectSizeDialogOpen() {
+    const dialogs = document.querySelectorAll('[role="dialog"], .md-dialog-container, .modal, [class*="dialog"]');
+    for (const dlg of dialogs) {
+      if (dlg.offsetParent === null) continue; // 不可见
+      const text = (dlg.innerText || '').toLowerCase();
+      if (text.includes('select size') || text.includes('select color')) return true;
     }
     return false;
   }
@@ -938,9 +976,12 @@
 
     // 按原始行号建结果映射
     const statusMap = {};
+    const reasonMap = {};
     const shipMap = {};
     for (const r of results) {
       statusMap[r.item._row] = r.status;
+      if (r.reason) reasonMap[r.item._row] = r.reason;
+      if (r.error) reasonMap[r.item._row] = reasonMap[r.item._row] || r.error;
       if (r.item._shipWarning) shipMap[r.item._row] = r.item._shipWarning;
     }
 
@@ -956,7 +997,17 @@
       const row = rawRows[i];
       if (!row || row.every(c => c == null || String(c || '').trim() === '')) continue;
       const st = statusMap[i + 1];
-      let label = st === 'success' ? (shipMap[i + 1] ? `⏳成功(可能缺货,${shipMap[i + 1]})` : '✅成功') : (st === 'skipped' ? '🚫缺货' : '❌失败');
+      const reason = reasonMap[i + 1] || '';
+      let label;
+      if (st === 'success') {
+        label = shipMap[i + 1] ? `⏳成功(可能缺货,${shipMap[i + 1]})` : '✅成功';
+      } else if (st === 'skipped') {
+        label = '🚫缺货';
+      } else if (reason) {
+        label = `❌${reason}`;
+      } else {
+        label = '❌失败';
+      }
       outRows.push(row.concat([nameMap[i + 1] || '', label]));
     }
 
