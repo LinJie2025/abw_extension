@@ -7,7 +7,7 @@
   const CONFIG = {
     // Excel 列映射（按列名匹配，支持别名数组，取第一个匹配成功的）
     columns: {
-      boxSku:   ['Box SKU', '订单行/包装/Box SKU'],            // Box SKU（拼商品页URL）
+      boxSku:   ['SKU', 'Box SKU', '订单行/包装/Box SKU'],     // Box SKU（拼商品页URL）
       innerRef: ['内部参考号', '订单行/产品/内部参考号'],       // 内部参考号/UPC（校验用）
       packaging:['包装', '订单行/包装'],                        // 包装类型（box / piece）
       quantity: ['包装数量', '订单行/包装数量'],                // 加购数量（重要！）
@@ -55,7 +55,7 @@
   };
 
   // 未知错误前缀（与 ERRORS 区分，Excel 中标记为开发排查类）
-  const UNKNOWN_ERR = '未知错误';
+  const UNKNOWN_ERR = '未知错误，请下载日志后交给开发人员排查';
 
   // ============================================================
   //  跨页面持久化（页面跳转刷新后面板/日志/任务全部恢复）
@@ -65,7 +65,9 @@
       try { return JSON.parse(sessionStorage.getItem(key) || 'null') ?? fallback; } catch (e) { return fallback; }
     },
     set(key, val) {
-      try { sessionStorage.setItem(key, JSON.stringify(val)); } catch (e) {}
+      try { sessionStorage.setItem(key, JSON.stringify(val)); } catch (e) {
+        console.warn('[ABW] sessionStorage 写入失败，可能存储空间不足', key, e);
+      }
     },
     remove(key) {
       try { sessionStorage.removeItem(key); } catch (e) {}
@@ -82,7 +84,7 @@
     xlRows: 'abw_xl_rows',       // 原始 Excel 全部行（下载时用）
     batchNo: 'abw_batch_no',     // 批次号（日志用）
   };
-  const MAX_LOGS = 500;
+  const MAX_LOGS = 20000; // ~1.4MB，覆盖1300+商品，远低于 sessionStorage 5MB 上限
 
   // ============================================================
   //  工具函数
@@ -90,8 +92,12 @@
   const log = (msg, type = 'info') => {
     // 持久化日志（跨页面保留）
     const logs = STORE.get(K.logs, []);
+    const truncated = logs.length >= MAX_LOGS;
     logs.push({ t: Date.now(), msg, type });
-    if (logs.length > MAX_LOGS) logs.splice(0, logs.length - MAX_LOGS);
+    if (logs.length > MAX_LOGS) {
+      logs.splice(0, logs.length - MAX_LOGS);
+      if (!truncated) console.warn(`[ABW] 日志已达上限 ${MAX_LOGS} 条，早期日志将被丢弃`);
+    }
     STORE.set(K.logs, logs);
 
     // 渲染到面板
@@ -484,6 +490,30 @@
     return { status: 'success', item };
   }
 
+  // 从页面提取价格：根据包装规格匹配，返回 { unitPrice, boxPrice } 或 null
+  function extractPriceFromPage(packaging) {
+    if (!packaging) return null;
+    const cleanPkg = packaging.replace(/\s+/g, ' ').trim().toLowerCase();
+    const links = document.querySelectorAll('a');
+    for (const link of links) {
+      const text = (link.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase();
+      if (!text.includes('box') && !text.includes('piece')) continue;
+      if (!text.includes(cleanPkg)) continue;
+      // 提取第一个 HK$ 数字
+      const firstMatch = text.match(/hk\$\s*([\d,]+\.?\d*)/i);
+      if (!firstMatch) continue;
+      const firstPrice = firstMatch[1].replace(/,/g, '');
+      // 含 "average" → 整箱批发，boxPrice=第一个HK$, unitPrice=average后面的
+      const avgMatch = text.match(/average\s*hk\$\s*([\d,]+\.?\d*)/i);
+      if (avgMatch) {
+        return { boxPrice: firstPrice, unitPrice: avgMatch[1].replace(/,/g, '') };
+      }
+      // 不含 "average" → 散件，无整箱价，单价就是第一个HK$
+      return { boxPrice: '', unitPrice: firstPrice };
+    }
+    return null;
+  }
+
   // 单条执行：SKU URL 直达商品页 → 检测加购按钮 → 设数量加购
   async function executeItem(item, attempt = 1) {
     const { boxSku, innerRef, packaging, quantity, _row } = item;
@@ -546,6 +576,16 @@
       // 提取商品英文名
       const h1 = document.querySelector('h1');
       if (h1) item._abwProductName = h1.textContent.trim();
+
+      // 提取价格（根据 Excel 包装列匹配页面链接）
+      const priceInfo = extractPriceFromPage(packaging);
+      if (priceInfo) {
+        item._boxPrice = priceInfo.boxPrice;
+        item._unitPrice = priceInfo.unitPrice;
+        log(`  💰 价格: 整箱=HK$${priceInfo.boxPrice} 单价=HK$${priceInfo.unitPrice}`, 'info');
+      } else {
+        log(`  ⚠️ 未匹配到包装"${packaging}"的价格`, 'warn');
+      }
 
       // ---- Step 2: 加购按钮二次确认（waitForProductPageReady 已确认过，这里兜底） ----
       const addBtn = await findAddToBagButton();
@@ -987,17 +1027,26 @@
 
     // 收集 ABW 商品名
     const nameMap = {};
+    const unitPriceMap = {};
+    const boxPriceMap = {};
     for (const r of results) {
       if (r.item._abwProductName) nameMap[r.item._row] = r.item._abwProductName;
+      if (r.item._unitPrice) unitPriceMap[r.item._row] = r.item._unitPrice;
+      if (r.item._boxPrice) boxPriceMap[r.item._row] = r.item._boxPrice;
     }
 
-    // 构建输出：原表头 + ABWproductname + 加购结果
-    const outRows = [headers.concat(['ABWproductname', '加购结果'])];
+    // 构建输出：原表头 + ABWproductname + 品牌名 + 单价 + 整箱批发价 + 加购结果
+    const outRows = [headers.concat(['ABWproductname', '品牌名', '单价', '整箱批发价', '加购结果'])];
     for (let i = 1; i < rawRows.length; i++) {
       const row = rawRows[i];
       if (!row || row.every(c => c == null || String(c || '').trim() === '')) continue;
       const st = statusMap[i + 1];
       const reason = reasonMap[i + 1] || '';
+      const productName = nameMap[i + 1] || '';
+      // 从 ABWproductname 提取品牌名（" - " 前面的部分）
+      const brandName = productName ? productName.split(' - ')[0].trim() : '';
+      const unitPrice = unitPriceMap[i + 1] || '';
+      const boxPrice = boxPriceMap[i + 1] || '';
       let label;
       if (st === 'success') {
         label = shipMap[i + 1] ? `⏳成功(可能缺货,${shipMap[i + 1]})` : '✅成功';
@@ -1008,7 +1057,7 @@
       } else {
         label = '❌失败';
       }
-      outRows.push(row.concat([nameMap[i + 1] || '', label]));
+      outRows.push(row.concat([productName, brandName, unitPrice, boxPrice, label]));
     }
 
     // 按 ABWproductname 列 A-Z 排序
@@ -1046,7 +1095,7 @@
       const sk = results.filter(r => r.status === 'skipped').length;
       new Notification('🛒 ABW 任务已结束', {
         body: `成功 ${sc} · 失败 ${fa} · 缺货 ${sk}`,
-        icon: 'https://www.asianbeautywholesale.com/favicon.ico',
+        icon: 'favicon-32x32.png',
         requireInteraction: true
       });
     }
@@ -1097,6 +1146,8 @@
         packaging: r.item.packaging,
         quantity: r.item.quantity,
         abwProductName: r.item._abwProductName || '',
+        unitPrice: r.item._unitPrice || '',
+        boxPrice: r.item._boxPrice || '',
         status: r.status,
         reason: r.reason || '',
         error: r.error || '',
