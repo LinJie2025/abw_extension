@@ -538,41 +538,57 @@
       }
 
       await waitForPageReady();
-      // ---- Step 1.1: 等待 DOM 稳定（Angular 渲染完成）+ 加购按钮检测 ----
-      const ready = await waitForProductPageReady(40000);
-      if (!ready.ready) {
-        if (ready.reason === 'no_button') {
-          // DOM 已稳定但无加购按钮 → 缺货
-          log(`  ⚠️ 页面已加载但无加购按钮，判定缺货`, 'warn');
-          return { status: 'skipped', item, reason: ERRORS.OUT_OF_STOCK };
-        }
-        // DOM 未稳定 → 真正的加载超时
-        log(`  ⚠️ 商品页加载超时（DOM 未稳定），跳过`, 'warn');
-        return { status: 'failed', item, reason: ERRORS.PAGE_TIMEOUT };
-      }
 
-      // ---- Cloudflare 安全验证检测 ----
+      // ---- Cloudflare 安全验证检测（必须在 waitForProductPageReady 之前，避免商品页文本误匹配）----
       let cfRetries = 0;
       const cfMaxRetries = 5;
       while (cfRetries < cfMaxRetries) {
         const bodyText = document.body.innerText;
-        const isCF = /(checking your browser|just a moment|ddos protection|cf-browser-verification|please wait.*seconds|安全验证|自动程序)/i.test(bodyText)
+        const isCF = /(checking your browser|just a moment|ddos protection|cf-browser-verification|please wait.*seconds)/i.test(bodyText)
+                  || /本网站使用安全服务/i.test(bodyText)  // Cloudflare 中文页面特征 短语
                   || document.querySelector('#challenge-form, #cf-challenge-running, .cf-browser-verification');
-        if (!isCF) {
-          log(`  无 Cloudflare 安全验证`, 'info');
-          break;
-        }
+        if (!isCF) break;
         cfRetries++;
-        log(`  ⚠️ Cloudflare 安全验证 (${cfRetries}/${cfMaxRetries})，等待 5 秒后重试...`, 'warn');
+        log(`  ⚠️ Cloudflare 安全验证 (${cfRetries}/${cfMaxRetries})，等待后重试...`, 'warn');
         await sleep(5000);
         location.reload();
         await waitForPageReady();
-        await waitForDomStable(3000, 20000);
       }
       if (cfRetries >= cfMaxRetries) {
         log(`  ❌ Cloudflare 验证未通过，跳过此商品`, 'error');
         return { status: 'failed', item, reason: ERRORS.CF_TIMEOUT };
       }
+
+      // ---- Step 1.1: 等待商品页关键元素就绪 ----
+      const ready = await waitForProductPageReady(40000);
+      if (!ready.ready) {
+        if (ready.reason === 'no_button') {
+          log(`  ⚠️ 页面已加载但无加购按钮，判定缺货`, 'warn');
+          return { status: 'skipped', item, reason: ERRORS.OUT_OF_STOCK };
+        }
+        log(`  ⚠️ 商品页加载超时（DOM 未稳定），跳过`, 'warn');
+        return { status: 'failed', item, reason: ERRORS.PAGE_TIMEOUT };
+      }
+
+      // ---- Step 3: 校验 UPC ----
+      const pageText = document.body.innerText;
+      const upcMatch = pageText.match(/UPC[:\s]*(\d[\d\s-]{8,})/i);
+      if (upcMatch) {
+        const pageUpc = upcMatch[1].replace(/\s/g, '');
+        const refClean = innerRef.replace(/\s/g, '');
+        if (refClean && !pageUpc.includes(refClean) && !refClean.includes(pageUpc)) {
+          log(`  ❌ UPC 不匹配: 页面=${pageUpc} vs Excel=${refClean}`, 'error');
+          return { status: 'failed', item, reason: ERRORS.UPC_MISMATCH };
+        }
+      }
+
+      // ---- Step 2: 加购按钮二次确认（waitForProductPageReady 已确认过，这里兜底） ----
+      const addBtn = await findAddToBagButton();
+      if (!addBtn) {
+        log(`  ⚠️ 无加购按钮（缺货），跳过`, 'warn');
+        return { status: 'skipped', item, reason: ERRORS.OUT_OF_STOCK };
+      }
+
 
       // 提取商品英文名
       const h1 = document.querySelector('h1');
@@ -588,25 +604,6 @@
         log(`  ⚠️ 未匹配到包装"${packaging}"的价格`, 'warn');
       }
 
-      // ---- Step 2: 加购按钮二次确认（waitForProductPageReady 已确认过，这里兜底） ----
-      const addBtn = await findAddToBagButton();
-      if (!addBtn) {
-        log(`  ⚠️ 无加购按钮（缺货），跳过`, 'warn');
-        return { status: 'skipped', item, reason: ERRORS.OUT_OF_STOCK };
-      }
-
-      // ---- Step 3: 校验 UPC ----
-      const pageText = document.body.innerText;
-      const upcMatch = pageText.match(/UPC[:\s]*(\d[\d\s-]{8,})/i);
-      if (upcMatch) {
-        const pageUpc = upcMatch[1].replace(/\s/g, '');
-        const refClean = innerRef.replace(/\s/g, '');
-        if (refClean && !pageUpc.includes(refClean) && !refClean.includes(pageUpc)) {
-          log(`  ❌ UPC 不匹配: 页面=${pageUpc} vs Excel=${refClean}`, 'error');
-          return { status: 'failed', item, reason: ERRORS.UPC_MISMATCH };
-        }
-      }
-
       // ---- Step 3: 配送时间检测（只查商品购买区域，>=21 天才标记可能缺货）----
       const shipArea = document.querySelector('.buyingOption, .productInfo, .shippingGrid');
       const shipText = shipArea ? shipArea.innerText : pageText;
@@ -615,7 +612,6 @@
         item._shipWarning = `Usually ships within ${shipMatch[1]} days`;
         log(`  ⚠️ ${item._shipWarning}（可能缺货）`, 'warn');
       }
-
 
       // ---- Step 5-8: 加购 ----
       return await doAddToBag(addBtn, item, addQty);
