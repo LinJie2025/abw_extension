@@ -52,6 +52,7 @@
     OUT_OF_STOCK:    '缺货',
     PAGE_TIMEOUT:    '页面加载超时，需人工加购',
     CF_TIMEOUT:      'Cloudflare验证超时，需人工加购',
+    UPC_MISMATCH:    '该SKU与该商品的UPC不匹配，请人工检测SKU与UPC进行加购',
   };
 
   // 未知错误前缀（与 ERRORS 区分，Excel 中标记为开发排查类）
@@ -555,7 +556,7 @@
       const cfMaxRetries = 5;
       while (cfRetries < cfMaxRetries) {
         const bodyText = document.body.innerText;
-        const isCF = /(checking your browser|just a moment|ddos protection|cf-browser-verification|please wait.*seconds)/i.test(bodyText)
+        const isCF = /(checking your browser|just a moment|ddos protection|cf-browser-verification|please wait.*seconds|安全验证|自动程序)/i.test(bodyText)
                   || document.querySelector('#challenge-form, #cf-challenge-running, .cf-browser-verification');
         if (!isCF) {
           log(`  无 Cloudflare 安全验证`, 'info');
@@ -601,7 +602,8 @@
         const pageUpc = upcMatch[1].replace(/\s/g, '');
         const refClean = innerRef.replace(/\s/g, '');
         if (refClean && !pageUpc.includes(refClean) && !refClean.includes(pageUpc)) {
-          log(`  ⚠️ UPC 不匹配: 页面=${pageUpc} vs Excel=${refClean}（继续尝试加购）`, 'warn');
+          log(`  ❌ UPC 不匹配: 页面=${pageUpc} vs Excel=${refClean}`, 'error');
+          return { status: 'failed', item, reason: ERRORS.UPC_MISMATCH };
         }
       }
 
