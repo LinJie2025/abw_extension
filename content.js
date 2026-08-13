@@ -7,10 +7,11 @@
   const CONFIG = {
     // Excel 列映射（按列名匹配，支持别名数组，取第一个匹配成功的）
     columns: {
-      boxSku:   ['SKU', 'Box SKU', '订单行/包装/Box SKU'],     // Box SKU（拼商品页URL）
+      boxSku:   ['订单行/包装/Box SKU', 'Box SKU'],            // 整箱 SKU（包装含 box 时用）
+      sku:      ['订单行/包装/SKU', 'SKU'],                    // 单件 SKU（包装为 piece 时用）
       innerRef: ['内部参考号', '订单行/产品/内部参考号'],       // 内部参考号/UPC（校验用）
-      packaging:['包装', '订单行/包装'],                        // 包装类型（box / piece）
-      quantity: ['包装数量', '订单行/包装数量'],                // 加购数量（重要！）
+      packaging:['订单行/包装', '包装'],                        // 包装类型（box / piece）
+      quantity: ['订单行/包装数量', '包装数量'],                // 加购数量（重要！）
       batchNo:  ['订单关联'],                                   // 订单关联（日志命名用）
     },
 
@@ -47,7 +48,8 @@
   //  错误码常量（集中管理，扩展只需在此加一行）
   // ============================================================
   const ERRORS = {
-    NO_SKU:          '无SKU，需人工加购',
+    NO_SKU:          '无SKU，需人工加购',       // 单件 SKU（piece）缺失
+    NO_BOX_SKU:      '无Box SKU，需人工加购',   // 整箱 SKU（box）缺失
     UNSUPPORTED_TYPE:'暂未支持该加购类型，需人工加购',
     OUT_OF_STOCK:    '缺货',
     PAGE_TIMEOUT:    '页面加载超时，需人工加购',
@@ -409,10 +411,14 @@
     console.log('[ABW] 列映射: ' + colMapLog.join(' | '));
 
     // 关键列缺失时直接报错（不再静默 fallback 成默认值！）
-    const required = ['boxSku', 'packaging', 'quantity'];
+    const required = ['packaging', 'quantity'];
     const missing = required.filter(k => colIdx[k] === -1);
     if (missing.length > 0) {
       throw new Error(`关键列未找到: ${missing.join(', ')}（可用列: ${headers.join(' | ')}）`);
+    }
+    // SKU 列：Box SKU 与单件 SKU 至少有一个（按包装类型二选一）
+    if (colIdx.boxSku === -1 && colIdx.sku === -1) {
+      throw new Error(`SKU 列未找到（需包含"订单行/包装/Box SKU"或"订单行/包装/SKU"，可用列: ${headers.join(' | ')}）`);
     }
 
     // 解析数据行（跳过表头）
@@ -421,18 +427,25 @@
       const row = rows[i];
       if (!row || row.every(c => c == null || String(c || '').trim() === '')) continue;
 
+      const packaging = String(row[colIdx.packaging] || '').trim();
+      // 按包装类型选 SKU 列：含 box → Box SKU；否则（piece）→ 单件 SKU
+      const useBoxSku = /box/i.test(packaging);
+      const skuCell = useBoxSku
+        ? (colIdx.boxSku >= 0 ? row[colIdx.boxSku] : '')
+        : (colIdx.sku >= 0 ? row[colIdx.sku] : '');
       const item = {
         _row: i + 1,
-        boxSku: String(row[colIdx.boxSku] || '').trim(),
+        boxSku: String(skuCell || '').trim(),
         innerRef: String(row[colIdx.innerRef] || '').trim(),
-        packaging: String(row[colIdx.packaging] || '').trim(),
+        packaging,
         quantity: parseInt(row[colIdx.quantity]) || 1,
         _noSku: false, // 标记无 SKU 的行
       };
 
-      // 无 boxSku 的行保留但标记，运行时直接跳过
+      // 所选 SKU 列为空/'-' 时标记，运行时直接跳过（box 缺 Box SKU、piece 缺单件 SKU 都提示）
       if (!item.boxSku || item.boxSku === '-') {
         item._noSku = true;
+        item._noSkuReason = useBoxSku ? ERRORS.NO_BOX_SKU : ERRORS.NO_SKU;
       }
       items.push(item);
     }
@@ -520,10 +533,11 @@
     const { boxSku, innerRef, packaging, quantity, _row } = item;
     const addQty = quantity;
 
-    // 无 Box SKU → 直接标记失败
+    // 无 SKU → 直接标记失败（box 缺 Box SKU / piece 缺单件 SKU）
     if (item._noSku) {
-      log(`📦 第${_row}行: 无SKU，需人工加购`, 'warn');
-      return { status: 'failed', item, reason: ERRORS.NO_SKU };
+      const reason = item._noSkuReason || ERRORS.NO_SKU;
+      log(`📦 第${_row}行: ${reason}`, 'warn');
+      return { status: 'failed', item, reason };
     }
 
     log(`📦 第${_row}行: SKU=${boxSku} | 规格=${packaging} | 数量=${addQty} | 第${attempt}次尝试`, 'action');
@@ -1033,8 +1047,28 @@
       if (r.item._boxPrice) boxPriceMap[r.item._row] = r.item._boxPrice;
     }
 
+    // 定位需回写的原始列：备注、整箱批发价（按表头名匹配，忽略大小写/分隔符）
+    const cleanHeader = (h) => String(h || '').replace(/[^a-zA-Z0-9\u4e00-\u9fa5]/g, '').toLowerCase();
+    const findColIdx = (names) => {
+      const cleanNames = names.map(cleanHeader);
+      return headers.findIndex(h => cleanNames.includes(cleanHeader(h)));
+    };
+    const remarkIdx = findColIdx(['订单行/备注', '备注']);
+    const boxPriceColIdx = findColIdx(['订单行/整箱批发价', '整箱批发价']);
+    // 派生"销售平台-区域"所需的列
+    const shopIdx = findColIdx(['订单行/店铺']);
+    const platformIdx = findColIdx(['订单行/店铺/电商平台']);
+    const packagingColIdx = findColIdx(['订单行/包装']);
+    // 订单关联列（结果需向下填充，与副本一致）
+    const orderRelIdx = findColIdx(['订单关联']);
+
+    // 表头："订单行/店铺/电商平台" 改名为 "销售平台-区域"
+    const outHeaders = headers.slice();
+    if (platformIdx >= 0) outHeaders[platformIdx] = '销售平台-区域';
+
     // 构建输出：原表头 + ABWproductname + 品牌名 + 单价 + 整箱批发价 + 加购结果
-    const outRows = [headers.concat(['ABWproductname', '品牌名', '单价', '整箱批发价', '加购结果'])];
+    const outRows = [outHeaders.concat(['ABWproductname', '品牌名', '单价', '整箱批发价', '加购结果'])];
+    let currentOrderRel = ''; // 订单关联向下填充的当前值
     for (let i = 1; i < rawRows.length; i++) {
       const row = rawRows[i];
       if (!row || row.every(c => c == null || String(c || '').trim() === '')) continue;
@@ -1055,7 +1089,32 @@
       } else {
         label = '❌失败';
       }
-      outRows.push(row.concat([productName, brandName, unitPrice, boxPrice, label]));
+
+      // 回写原始列：缺货/可能缺货 → 备注；有整箱批发价 → 覆盖整箱批发价列
+      const outRow = row.slice();
+      // 订单关联 向下填充（非空值向下传播，直到下一个非空值）
+      if (orderRelIdx >= 0) {
+        const rawRel = String(row[orderRelIdx] || '').trim();
+        if (rawRel) currentOrderRel = rawRel;
+        outRow[orderRelIdx] = currentOrderRel;
+      }
+      // 派生"销售平台-区域"：电商平台 + '-' + 店铺首词（piece 且首词为 MX 时改 BR）
+      if (platformIdx >= 0) {
+        const shopName = shopIdx >= 0 ? String(row[shopIdx] || '').trim() : '';
+        const platform = String(row[platformIdx] || '').trim();
+        const packagingVal = packagingColIdx >= 0 ? String(row[packagingColIdx] || '').trim() : '';
+        let region = shopName.split(/\s+/)[0] || '';
+        if (!/box/i.test(packagingVal) && region.toUpperCase() === 'MX') region = 'BR';
+        outRow[platformIdx] = [platform, region].filter(Boolean).join('-');
+      }
+      if (st === 'skipped') {
+        if (remarkIdx >= 0) outRow[remarkIdx] = '缺货';
+      } else if (st === 'success' && shipMap[i + 1]) {
+        if (remarkIdx >= 0) outRow[remarkIdx] = '可能缺货';
+      }
+      if (boxPrice && boxPriceColIdx >= 0) outRow[boxPriceColIdx] = parseFloat(boxPrice);
+
+      outRows.push(outRow.concat([productName, brandName, unitPrice, boxPrice, label]));
     }
 
     // 按 ABWproductname 列 A-Z 排序
