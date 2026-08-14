@@ -41,6 +41,7 @@
       pageLoadTimeout: 8000,// 页面加载超时 (ms)
       modalWaitTimeout: 8000, // 等待加购弹窗超时 (ms)
       retryCount: 2,        // 单条失败重试次数
+      mergeSameSku: true,   // 同一 SKU+包装 的多行（不同订单关联）合并为一次加购，数量求和
     },
   };
 
@@ -63,17 +64,52 @@
   // ============================================================
   //  跨页面持久化（页面跳转刷新后面板/日志/任务全部恢复）
   // ============================================================
+  // 批次键（挂到当前 runId 下的键，刷新/跳页不丢）
+  const BATCH_BASE_KEYS = [
+    'abw_logs', 'abw_parsed_items', 'abw_pending', 'abw_pending_results',
+    'abw_xl_headers', 'abw_xl_rows', 'abw_batch_no', 'abw_file_name', 'abw_total_count',
+  ];
+
+  // 当前总任务标识（runId）：上传一次文件生成一个，刷新后据此恢复
+  let currentRunId = (() => { try { return sessionStorage.getItem('abw_currentRunId') || ''; } catch (e) { return ''; } })();
+
+  // 把逻辑键映射到物理键：批次键 → abw_run_<id>_<key>；全局键原样
+  function realKey(key) {
+    if (currentRunId && BATCH_BASE_KEYS.includes(key)) {
+      return `abw_run_${currentRunId}_${key.replace(/^abw_/, '')}`;
+    }
+    return key;
+  }
+  function newRunId() {
+    return 'run_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 6);
+  }
+  // 清空当前批次的所有数据
+  function clearCurrentBatch() {
+    if (!currentRunId) return;
+    for (const k of BATCH_BASE_KEYS) {
+      try { sessionStorage.removeItem(`abw_run_${currentRunId}_${k.replace(/^abw_/, '')}`); } catch (e) {}
+    }
+  }
+  // 开启新批次：清旧批次 → 切新 runId → 存文件名
+  function startNewBatch(fileName) {
+    clearCurrentBatch();
+    currentRunId = newRunId();
+    try { sessionStorage.setItem('abw_currentRunId', currentRunId); } catch (e) {}
+    STORE.set(K.fileName, fileName || '');
+  }
+
   const STORE = {
     get(key, fallback) {
-      try { return JSON.parse(sessionStorage.getItem(key) || 'null') ?? fallback; } catch (e) { return fallback; }
+      try { return JSON.parse(sessionStorage.getItem(realKey(key)) || 'null') ?? fallback; } catch (e) { return fallback; }
     },
     set(key, val) {
-      try { sessionStorage.setItem(key, JSON.stringify(val)); } catch (e) {
+      try { sessionStorage.setItem(realKey(key), JSON.stringify(val)); } catch (e) {
         console.warn('[ABW] sessionStorage 写入失败，可能存储空间不足', key, e);
+        try { log(`⚠️ 存储空间不足，${key} 保存失败（请清理日志/重新上传Excel）`, 'error'); } catch (e2) {}
       }
     },
     remove(key) {
-      try { sessionStorage.removeItem(key); } catch (e) {}
+      try { sessionStorage.removeItem(realKey(key)); } catch (e) {}
     },
   };
   const K = {
@@ -86,8 +122,10 @@
     xlHeaders: 'abw_xl_headers', // 原始 Excel 表头（下载时用）
     xlRows: 'abw_xl_rows',       // 原始 Excel 全部行（下载时用）
     batchNo: 'abw_batch_no',     // 批次号（日志用）
+    fileName: 'abw_file_name',   // 当前批次来源文件名
+    totalCount: 'abw_total_count', // 本批次任务总数（进度条分母）
   };
-  const MAX_LOGS = 20000; // ~1.4MB，覆盖1300+商品，远低于 sessionStorage 5MB 上限
+  const MAX_LOGS = 5000; // ~350KB，覆盖1300+商品（日志过多会撑爆 sessionStorage，导致跳转后无法续跑）
 
   // ============================================================
   //  工具函数
@@ -145,7 +183,8 @@
   // ============================================================
 
   // 严格判断元素是否真正可见、可交互（不只是存在于 DOM）
-  function isElementReal(el) {
+  // allowDisabled=true 时放行 disabled 按钮 —— 按钮可能因页面状态暂时禁用，仍需能找到
+  function isElementReal(el, allowDisabled = false) {
     if (!el) return false;
     // 1) 必须挂载在 document 中
     if (!document.contains(el)) return false;
@@ -154,8 +193,8 @@
     // 3) 尺寸为 0 不可交互
     const rect = el.getBoundingClientRect();
     if (rect.width <= 1 || rect.height <= 1) return false;
-    // 4) disabled
-    if (el.disabled) return false;
+    // 4) disabled（默认视为不可用；allowDisabled=true 时放行）
+    if (!allowDisabled && el.disabled) return false;
     // 5) computed style: hidden / none / opacity:0
     const style = window.getComputedStyle(el);
     if (style.visibility === 'hidden') return false;
@@ -421,11 +460,35 @@
       throw new Error(`SKU 列未找到（需包含"订单行/包装/Box SKU"或"订单行/包装/SKU"，可用列: ${headers.join(' | ')}）`);
     }
 
+    // ---- 断点续跑检测 ----
+    // 文件里存在"加购结果"列 → 说明是加购一半的结果文件：
+    // 结果非空的行视为已处理（跳过），只加购结果为空的行
+    const resultColIdx = findColumnIndex(['加购结果']);
+    const resumeStats = {
+      hadResultCol: resultColIdx >= 0,
+      doneCount: 0,      // 已处理行数
+      successCount: 0,   // 其中成功（含已在购物车）
+      skipCount: 0,      // 其中缺货
+      failCount: 0,      // 其中失败
+    };
+
     // 解析数据行（跳过表头）
     const items = [];
     for (let i = 1; i < rows.length; i++) {
       const row = rows[i];
       if (!row || row.every(c => c == null || String(c || '').trim() === '')) continue;
+
+      // 断点续跑：该行已有加购结果（非空）→ 已处理，跳过
+      if (resultColIdx >= 0) {
+        const doneLabel = String(row[resultColIdx] || '').trim();
+        if (doneLabel) {
+          resumeStats.doneCount++;
+          if (/成功|已在购物车/.test(doneLabel)) resumeStats.successCount++;
+          else if (/缺货/.test(doneLabel)) resumeStats.skipCount++;
+          else resumeStats.failCount++;
+          continue;
+        }
+      }
 
       const packaging = String(row[colIdx.packaging] || '').trim();
       // 按包装类型选 SKU 列：含 box → Box SKU；否则（piece）→ 单件 SKU
@@ -457,7 +520,65 @@
       const firstRowIdx = items[0]._row - 1; // _row 从1开始
       batchNo = String(rows[firstRowIdx][colIdx.batchNo] || '').trim();
     }
-    return { items, headers, colMapLog, rawRows: rows, batchNo };
+    return { items, headers, colMapLog, rawRows: rows, batchNo, resumeStats };
+  }
+
+  // ============================================================
+  //  同 SKU 聚合（合并加购）
+  //  同一「SKU+包装」出现在多行（分属不同订单关联）→ 合并为一个任务，
+  //  数量求和、一次导航一次加购，避免重复导航/第二次加购覆盖数量。
+  //  输入已含断点续跑过滤（只含本次要跑的行），组内部分行已处理时聚合的
+  //  是「未处理行」的数量之和，购物车总量累计正确。
+  // ============================================================
+  function mergeSameSkuItems(items) {
+    if (!CONFIG.behavior.mergeSameSku || items.length < 2) return items;
+
+    const groups = new Map(); // key: sku|packaging
+    const order = [];         // 聚合后的任务列表（保持 Excel 顺序）
+    const upcWarnings = [];
+    let mergedRows = 0;
+
+    for (const it of items) {
+      // 无 SKU 的行不聚合（运行时直接标记失败），保持单任务
+      if (it._noSku || !it.boxSku) {
+        order.push(it);
+        continue;
+      }
+      const key = `${it.boxSku}|${it.packaging}`;
+      const g = groups.get(key);
+      if (!g) {
+        const merged = { ...it, _rows: [it._row] };
+        groups.set(key, merged);
+        order.push(merged);
+      } else {
+        g.quantity += it.quantity;
+        g._rows.push(it._row);
+        // 内部参考号不一致 → 数据异常提示（UPC 校验仍用组内第一行）
+        if (it.innerRef && g.innerRef && it.innerRef !== g.innerRef) {
+          upcWarnings.push(`SKU=${it.boxSku}: Row${g._rows[0]} 与 Row${it._row} 的内部参考号不一致 (${g.innerRef} vs ${it.innerRef})，请注意核对`);
+        }
+        mergedRows++;
+      }
+    }
+
+    // 统一补齐 _rows（未合并/无SKU 的任务也是单元素数组，恢复与回写逻辑统一）
+    for (const it of order) {
+      if (!it._rows) it._rows = [it._row];
+    }
+
+    if (mergedRows > 0) {
+      log(`🔗 同SKU聚合: ${items.length} 行 → ${order.length} 个任务（合并 ${mergedRows} 行，数量已求和，一次导航一次加购）`, 'action');
+      upcWarnings.forEach(w => log(`  ⚠️ ${w}`, 'warn'));
+    }
+    return order;
+  }
+
+  // 取一个结果对应的所有原始 Excel 行号（兼容无 _rows 的旧批次数据）
+  function resultRows(r) {
+    const item = r && r.item;
+    if (!item) return [];
+    if (item._rows && item._rows.length) return item._rows;
+    return item._row ? [item._row] : [];
   }
 
   // ============================================================
@@ -465,6 +586,19 @@
   // ============================================================
   let isRunning = false;
   const results = [];
+
+  // 任务执行标识：统一驱动「立即停止 / 开始加购」按钮显示 + 持久化（刷新/跳页可恢复）
+  const RUNNING_KEY = 'abw_running';
+  function setRunning(running) {
+    isRunning = running;
+    try { sessionStorage.setItem(RUNNING_KEY, running ? '1' : '0'); } catch (e) {}
+    const stopBtn = document.getElementById('abw-stop-btn');
+    const startBtn = document.getElementById('abw-start-btn');
+    if (stopBtn) stopBtn.style.display = running ? '' : 'none';
+    if (startBtn) startBtn.style.display = running ? 'none' : '';
+  }
+  // 启动时读取持久化标识（跳页续跑时保持运行态，恢复逻辑会据 pending 再校正）
+  isRunning = (() => { try { return sessionStorage.getItem(RUNNING_KEY) === '1'; } catch (e) { return false; } })();
 
   // 加购后半段（设数量 → 点击 → 校验弹窗）
   async function doAddToBag(_addBtn, item, addQty) {
@@ -540,16 +674,35 @@
       return { status: 'failed', item, reason };
     }
 
-    log(`📦 第${_row}行: SKU=${boxSku} | 规格=${packaging} | 数量=${addQty} | 第${attempt}次尝试`, 'action');
+    // 聚合任务时日志显示"第N行"或"第N等M行"
+    const rowLabel = item._rows && item._rows.length > 1 ? `${_row}等${item._rows.length}行` : `${_row}`;
+    log(`📦 第${rowLabel}行: SKU=${boxSku} | 规格=${packaging} | 数量=${addQty} | 第${attempt}次尝试`, 'action');
 
     try {
       // ---- Step 1: 导航到商品页 ----
+      // 匹配 pid.<SKU> 或 cpid=<SKU>（部分商品是"主商品pid + 变体cpid"结构，
+      // 服务器会把 pid.<cpid> 请求 301 重定向到 pid.<主pid>?cpid=<变体>，只认 pid 会永远匹配不上 → 无限刷新）
       const productUrl = `/info.html/pid.${boxSku}`;
-      if (!location.href.includes(boxSku)) {
-        log(`  → 导航到商品页...`, 'info');
+      const isOnProductPage = new RegExp(
+        `/info\\.html/pid\\.${boxSku}(?:[/?#]|$)|[?&]cpid=${boxSku}(?:&|$)`,
+        'i'
+      ).test(location.href);
+      if (!isOnProductPage) {
+        // 防循环导航保险: 同一 SKU 连续导航 3 次仍未定位到目标页 → 放弃并报错，避免无限刷新
+        const navKey = 'abw_nav_' + boxSku;
+        const navCount = parseInt(sessionStorage.getItem(navKey) || '0', 10) + 1;
+        if (navCount > 3) {
+          sessionStorage.removeItem(navKey);
+          log(`  ❌ 导航 ${navCount - 1} 次后仍未定位到该 SKU 页面（SKU 可能是变体ID/已失效，需人工加购）`, 'error');
+          return { status: 'failed', item, reason: 'SKU定位失败，需人工加购' };
+        }
+        sessionStorage.setItem(navKey, String(navCount));
+        log(`  → 导航到商品页 (第${navCount}次)...`, 'info');
         window.location.href = productUrl;
         return { status: 'navigating', item };
       }
+      // 已到达目标页，清除该 SKU 的防循环标记
+      sessionStorage.removeItem('abw_nav_' + boxSku);
 
       await waitForPageReady();
 
@@ -647,12 +800,13 @@
     // 在指定 document 中查找（主文档和 iframe 共用）
     function searchInDoc(rootDoc) {
       // 策略1: 匹配 "add to bag" 文本，优先按钮类型再兜底 span/div
+      // 注意: 传 allowDisabled=true，按钮可能因页面状态暂时禁用，仍需能找到（点击失败时由后续报错体现）
       const _selectBest = (els, exactMatch) => {
         let best = null;
         for (const el of els) {
           const txt = (el.textContent || el.value || '').trim();
           const hits = exactMatch ? txt.toLowerCase() === 'add to bag' : /add\s*to\s*bag/i.test(txt);
-          if (hits && isElementReal(el)) {
+          if (hits && isElementReal(el, true)) {
             if (!best || el.children.length < best.children.length) best = el;
           }
         }
@@ -666,11 +820,11 @@
 
       // 策略2: class 包含 add/bag/cart 的元素
       const byClass = rootDoc.querySelector('[class*="add-to-bag"], [class*="addToBag"], [class*="add_bag"], [class*="btn-add"], [class*="addtobag"], [class*="addToCart"], [class*="add-to-cart"]');
-      if (byClass && isElementReal(byClass)) return byClass;
+      if (byClass && isElementReal(byClass, true)) return byClass;
 
       // 策略3: span.active（选规格后激活的加购按钮）
       const activeSpan = rootDoc.querySelector('span.active');
-      if (activeSpan && isElementReal(activeSpan)) return activeSpan;
+      if (activeSpan && isElementReal(activeSpan, true)) return activeSpan;
 
       return null;
     }
@@ -742,74 +896,109 @@
 
   // 执行全部任务
   async function runAll(items) {
-    isRunning = true;
+    setRunning(true);
     forceStop = false;
     const _startedAt = new Date().toISOString();
+    // 全批次任务总数（进度条分母）；断点续跑/继续模式时 items 是剩余行，分母仍是全批次总数
+    const total = STORE.get(K.totalCount, items.length);
 
     log(`🚀 开始执行，共 ${items.length} 条任务`, 'action');
-    updateProgress(0, items.length);
+    updateProgress(results.length, total);
 
     let stoppedByUser = false;
-    for (let i = 0; i < items.length; i++) {
-      if (forceStop) {
-        stoppedByUser = true;
-        break;
-      }
-
-      let result;
-      try {
-        result = await executeItem(items[i]);
-      } catch (err) {
-        // 用户点击「立即停止」：直接终止，不保存状态
-        if (err === StopError) {
-          log('⏹️ 已立即停止（当前条目已中断）', 'warn');
-          isRunning = false;
-          document.getElementById('abw-stop-btn').style.display = 'none';
-          document.getElementById('abw-start-btn').style.display = '';
-          return;
+    let crashed = false;
+    let navigating = false;
+    try {
+      for (let i = 0; i < items.length; i++) {
+        if (forceStop) {
+          stoppedByUser = true;
+          break;
         }
-        throw err;
-      }
-      results.push(result);
-      if (!results._startedAt) results._startedAt = _startedAt;
-      updateProgress(i + 1, items.length);
 
-      // 如果是导航状态（页面跳转），保存剩余任务，新页面自动续跑
-      if (result.status === 'navigating') {
-        STORE.set(K.pending, items.slice(i));
+        let result;
+        try {
+          result = await executeItem(items[i]);
+        } catch (err) {
+          // 用户点击「立即停止」：直接终止，不保存状态
+          if (err === StopError) {
+            log('⏹️ 已立即停止（当前条目已中断）', 'warn');
+            stoppedByUser = true;
+            break;
+          }
+          throw err;
+        }
+        results.push(result);
+        if (!results._startedAt) results._startedAt = _startedAt;
+        // 实时落盘：每完成一条立即持久化，刷新后据此从断点恢复（方案成立的地基）
         STORE.set(K.results, results);
-        isRunning = false;
+        updateProgress(results.length, total);
+
+        // 如果是导航状态（页面跳转），保存剩余任务，新页面自动续跑
+        if (result.status === 'navigating') {
+          STORE.set(K.pending, items.slice(i));
+          STORE.set(K.results, results);
+          // 校验保存是否成功，避免 sessionStorage 满导致跳转后无法续跑（表现为任务莫名中断）
+          if (!STORE.get(K.pending, null)) {
+            log('⚠️ 剩余任务保存失败（sessionStorage 可能已满），跳转后将无法自动续跑！请清理日志后重试', 'error');
+          }
+          navigating = true;
+          break;
+        }
+
+        // 条目间延迟
+        if (i < items.length - 1) {
+          await randomDelay();
+        }
+      }
+    } catch (err) {
+      // 引擎级异常：绝不能静默消失（否则任务卡死、按钮状态不恢复）
+      crashed = true;
+      log(`❌ 执行引擎异常，任务已终止: ${err.message}`, 'error');
+      console.error('[ABW] runAll crashed', err);
+    } finally {
+      // 导航跳转 → 保持运行态（新页面自动续跑并显示「立即停止」）
+      if (navigating) {
+        setRunning(true);
         return;
       }
+      // 任务结束/停止/异常 → 恢复为「开始加购」态
+      setRunning(false);
 
-      // 条目间延迟
-      if (i < items.length - 1) {
-        await randomDelay();
+      if (stoppedByUser) {
+        log('⏹️ 已停止', 'warn');
+        notifyComplete();
+      } else if (crashed) {
+        document.getElementById('abw-dl-btn').style.display = '';
+        showSummary(results);
+        log('⚠️ 任务被异常中断，请下载开发日志排查', 'error');
+      } else {
+        document.getElementById('abw-dl-btn').style.display = '';
+        const logEntries = STORE.get(K.logs, []);
+        document.getElementById('abw-log-btn').style.display = logEntries.length > 0 ? '' : 'none';
+        showSummary(results);
+        const sc = results.filter(r => r.status === 'success').length;
+        const fa = results.filter(r => r.status === 'failed').length;
+        const sk = results.filter(r => r.status === 'skipped').length;
+        log(`✅ 全部完成! 成功:${sc} 失败:${fa}${sk > 0 ? ' 缺货:' + sk : ''}`, 'success');
+        notifyComplete();
       }
-    }
-
-    isRunning = false;
-    document.getElementById('abw-stop-btn').style.display = 'none';
-    document.getElementById('abw-start-btn').style.display = '';
-    if (stoppedByUser) {
-      log('⏹️ 已停止', 'warn');
-      notifyComplete();
-    } else {
-      document.getElementById('abw-dl-btn').style.display = '';
-      const logEntries = STORE.get(K.logs, []);
-      document.getElementById('abw-log-btn').style.display = logEntries.length > 0 ? '' : 'none';
-      showSummary(results);
-      const sc = results.filter(r => r.status === 'success').length;
-      const fa = results.filter(r => r.status === 'failed').length;
-      const sk = results.filter(r => r.status === 'skipped').length;
-      log(`✅ 全部完成! 成功:${sc} 失败:${fa}${sk > 0 ? ' 缺货:' + sk : ''}`, 'success');
-      notifyComplete();
     }
   }
 
   // ============================================================
   //  浮动面板 UI
   // ============================================================
+  // 更新面板上的批次信息显示（文件名 + 已完成/总）
+  function updateBatchInfo() {
+    const el = document.getElementById('abw-batch-info');
+    if (!el) return;
+    const fileName = STORE.get(K.fileName, '');
+    const total = STORE.get(K.totalCount, 0);
+    if (!fileName && !total) { el.style.display = 'none'; return; }
+    el.style.display = '';
+    el.textContent = `📄 ${fileName || '(未知文件)'} · 已完成 ${results.length} / 总 ${total}`;
+  }
+
   function createPanel() {
     const panel = document.createElement('div');
     panel.id = 'abw-panel';
@@ -833,6 +1022,7 @@
         #abw-body.collapsed { display: none; }
         .abw-section { margin-bottom: 14px; }
         .abw-label { color: #aaa; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 6px; }
+        #abw-batch-info { color: #e94560; font-size: 12px; margin: 0 0 10px; padding: 6px 10px; background: rgba(233,69,96,0.1); border: 1px solid rgba(233,69,96,0.25); border-radius: 6px; }
         .abw-file-wrap {
           position: relative; border: 2px dashed rgba(233,69,96,0.3); border-radius: 10px;
           padding: 20px; text-align: center; transition: all 0.3s; cursor: pointer;
@@ -879,6 +1069,7 @@
         <span id="abw-toggle">−</span>
       </div>
       <div id="abw-body">
+        <div id="abw-batch-info" style="display:none;"></div>
         <!-- 文件上传 -->
         <div class="abw-section">
           <div class="abw-label">📁 采购单 Excel</div>
@@ -904,7 +1095,7 @@
           <button class="abw-btn abw-btn-sec" id="abw-clear-btn" disabled>🗑 清空日志</button>
         </div>
         <div class="abw-btn-row">
-          <button class="abw-btn abw-btn-sec" id="abw-dl-btn" style="display:none;">📥 下载结果 Excel</button>
+          <button class="abw-btn abw-btn-sec" id="abw-dl-btn">📥 下载结果 Excel</button>
         </div>
         <div class="abw-btn-row">
           <button class="abw-btn abw-btn-sec" id="abw-log-btn" style="display:none;">📋 下载开发日志</button>
@@ -919,7 +1110,7 @@
         <!-- 汇总 -->
         <div id="abw-summary"></div>
       </div>
-      <div id="abw-footer">ABW Auto Purchase v1.0.4 · 数据不出浏览器 · 跨页面保持</div>
+      <div id="abw-footer">ABW Auto Purchase v1.10.2 · 数据不出浏览器 · 跨页面保持</div>
     `;
     document.body.appendChild(panel);
 
@@ -973,15 +1164,28 @@
     // 按钮
     document.getElementById('abw-start-btn').addEventListener('click', () => {
       const items = STORE.get(K.items, []);
-      if (items.length > 0) {
-        // 运行中：显示停止按钮，隐藏开始按钮
-        document.getElementById('abw-stop-btn').style.display = '';
-        document.getElementById('abw-start-btn').style.display = 'none';
-        document.getElementById('abw-dl-btn').style.display = 'none';
-        document.getElementById('abw-log-btn').style.display = 'none';
-        results.length = 0;
-        runAll(items);
+      if (items.length === 0) return;
+      // 进入运行态：显示「立即停止」、隐藏「开始加购」（下载按钮常驻，执行中随时可导出进度）
+      setRunning(true);
+      document.getElementById('abw-log-btn').style.display = 'none';
+
+      // 区分「继续」与「全新」：有已完成结果 → 从剩余行继续，不清空 results
+      const savedResults = STORE.get(K.results, []);
+      let toRun = items;
+      if (savedResults.length > 0) {
+        const doneRows = new Set();
+        savedResults.forEach(r => resultRows(r).forEach(n => doneRows.add(n)));
+        toRun = items.filter(it => !doneRows.has(it._row));
+        if (toRun.length === 0) {
+          log('✅ 所有任务均已完成，无需再跑', 'success');
+          setRunning(false);
+          return;
+        }
+        log(`▶️ 从断点继续：跳过已完成 ${savedResults.length} 条，剩余 ${toRun.length} 条`, 'action');
+      } else {
+        results.length = 0; // 全新执行
       }
+      runAll(toRun);
     });
     // 「立即停止」：点击直接中断当前任务，不记录状态
     document.getElementById('abw-stop-btn').addEventListener('click', () => {
@@ -992,6 +1196,9 @@
       document.getElementById('abw-log').innerHTML = '';
       STORE.remove(K.logs);
       results.length = 0;
+      STORE.remove(K.results); // 同步清空落盘结果，避免刷新后恢复旧进度
+      updateProgress(0, STORE.get(K.totalCount, 0));
+      updateBatchInfo();
     });
     // 下载结果 Excel
     document.getElementById('abw-dl-btn').addEventListener('click', downloadResultExcel);
@@ -999,24 +1206,46 @@
     document.getElementById('abw-log-btn').addEventListener('click', downloadDevLog);
 
 
-    // 恢复已解析的任务列表（跨页面保持）
+    // ===== 批次恢复（按优先级）=====
     const savedItems = STORE.get(K.items, []);
-    if (savedItems.length > 0) {
-      renderTaskList(savedItems);
-      document.getElementById('abw-start-btn').disabled = false;
-      document.getElementById('abw-clear-btn').disabled = false;
-    }
-
-    // 静默恢复跳转中的任务（页面加载后自动续跑，无日志噪音）
     const pendingItems = STORE.get(K.pending, null);
+    const savedResults = STORE.get(K.results, []);
+    const totalCount = STORE.get(K.totalCount, savedItems.length);
+
     if (pendingItems && pendingItems.length > 0) {
-      const prevResults = STORE.get(K.results, []);
+      // ① 跳页中断：自动续跑（串行导航必需机制，保持不动）→ 进入运行态，显示「立即停止」
       STORE.remove(K.pending);
-      STORE.remove(K.results);
-      results.push(...prevResults);
+      results.push(...savedResults);
       renderTaskList(pendingItems);
       document.getElementById('abw-start-btn').disabled = false;
+      document.getElementById('abw-clear-btn').disabled = false;
+      setRunning(true);
+      updateBatchInfo();
       setTimeout(() => runAll(pendingItems), 2000);
+    } else {
+      // 刷新/全新 → 停止态，显示「开始加购」
+      setRunning(false);
+      if (savedResults.length > 0 && savedItems.length > 0) {
+        // ② 同页执行中被刷新/中断：恢复结果 + 剩余列表 + 进度，手动开始
+        results.push(...savedResults);
+        const doneRows = new Set();
+        savedResults.forEach(r => resultRows(r).forEach(n => doneRows.add(n)));
+        const remaining = savedItems.filter(it => !doneRows.has(it._row));
+        renderTaskList(remaining.length > 0 ? remaining : savedItems);
+        document.getElementById('abw-start-btn').disabled = remaining.length === 0;
+        document.getElementById('abw-clear-btn').disabled = false;
+        updateProgress(savedResults.length, totalCount);
+        log(`⏸️ 检测到未完成批次：已完成 ${savedResults.length}/${totalCount}，剩余 ${remaining.length} 条待加购（点击「开始加购」继续）`, 'warn');
+        updateBatchInfo();
+      } else {
+        // ③ 全新 / 无未完成任务
+        if (savedItems.length > 0) {
+          renderTaskList(savedItems);
+          document.getElementById('abw-start-btn').disabled = false;
+          document.getElementById('abw-clear-btn').disabled = false;
+        }
+        updateBatchInfo();
+      }
     }
   }
 
@@ -1026,25 +1255,23 @@
     const rawRows = STORE.get(K.xlRows, []);
     if (!headers.length || !rawRows.length) { log('⚠️ 无原始数据，请重新上传 Excel', 'warn'); return; }
 
-    // 按原始行号建结果映射
+    // 按原始行号建结果映射（一个聚合任务 → 组内所有原始行标相同结果）
     const statusMap = {};
     const reasonMap = {};
     const shipMap = {};
-    for (const r of results) {
-      statusMap[r.item._row] = r.status;
-      if (r.reason) reasonMap[r.item._row] = r.reason;
-      if (r.error) reasonMap[r.item._row] = reasonMap[r.item._row] || r.error;
-      if (r.item._shipWarning) shipMap[r.item._row] = r.item._shipWarning;
-    }
-
-    // 收集 ABW 商品名
     const nameMap = {};
     const unitPriceMap = {};
     const boxPriceMap = {};
     for (const r of results) {
-      if (r.item._abwProductName) nameMap[r.item._row] = r.item._abwProductName;
-      if (r.item._unitPrice) unitPriceMap[r.item._row] = r.item._unitPrice;
-      if (r.item._boxPrice) boxPriceMap[r.item._row] = r.item._boxPrice;
+      for (const rowNo of resultRows(r)) {
+        statusMap[rowNo] = r.status;
+        if (r.reason) reasonMap[rowNo] = r.reason;
+        if (r.error) reasonMap[rowNo] = reasonMap[rowNo] || r.error;
+        if (r.item._shipWarning) shipMap[rowNo] = r.item._shipWarning;
+        if (r.item._abwProductName) nameMap[rowNo] = r.item._abwProductName;
+        if (r.item._unitPrice) unitPriceMap[rowNo] = r.item._unitPrice;
+        if (r.item._boxPrice) boxPriceMap[rowNo] = r.item._boxPrice;
+      }
     }
 
     // 定位需回写的原始列：备注、整箱批发价（按表头名匹配，忽略大小写/分隔符）
@@ -1066,8 +1293,18 @@
     const outHeaders = headers.slice();
     if (platformIdx >= 0) outHeaders[platformIdx] = '销售平台-区域';
 
-    // 构建输出：原表头 + ABWproductname + 品牌名 + 单价 + 整箱批发价 + 加购结果
-    const outRows = [outHeaders.concat(['ABWproductname', '品牌名', '单价', '整箱批发价', '加购结果'])];
+    // 附加列：文件里已有该列则复用其位置（支持"结果文件再导入→再导出"往返），否则追加
+    const extraColDefs = ['ABWproductname', '品牌名', '单价', '整箱批发价', '加购结果'];
+    const extraColIdx = {};
+    for (const name of extraColDefs) {
+      let idx = findColIdx([name]);
+      if (idx < 0) { idx = outHeaders.length; outHeaders.push(name); }
+      extraColIdx[name] = idx;
+    }
+    // 导入文件里原有的"加购结果"列索引（未执行的行保留旧结果值）
+    const prevResultIdx = findColIdx(['加购结果']);
+
+    const outRows = [outHeaders.slice()];
     let currentOrderRel = ''; // 订单关联向下填充的当前值
     for (let i = 1; i < rawRows.length; i++) {
       const row = rawRows[i];
@@ -1079,16 +1316,17 @@
       const brandName = productName ? productName.split(' - ')[0].trim() : '';
       const unitPrice = unitPriceMap[i + 1] || '';
       const boxPrice = boxPriceMap[i + 1] || '';
-      let label;
+      // 结果标签：本次执行过 → 覆盖；未执行 → 保留导入文件里的旧结果（无则留空）
+      const prevLabel = prevResultIdx >= 0 ? String(row[prevResultIdx] || '').trim() : '';
+      let label = prevLabel;
       if (st === 'success') {
         label = shipMap[i + 1] ? `⏳成功(可能缺货,${shipMap[i + 1]})` : '✅成功';
       } else if (st === 'skipped') {
         label = '🚫缺货';
-      } else if (reason) {
-        label = `❌${reason}`;
-      } else {
-        label = '❌失败';
+      } else if (st === 'failed') {
+        label = `❌${reason || '失败'}`;
       }
+      // st 为空（未执行）→ 保持 prevLabel（断点续跑的关键：不把未跑的行误标为失败）
 
       // 回写原始列：缺货/可能缺货 → 备注；有整箱批发价 → 覆盖整箱批发价列
       const outRow = row.slice();
@@ -1114,11 +1352,21 @@
       }
       if (boxPrice && boxPriceColIdx >= 0) outRow[boxPriceColIdx] = parseFloat(boxPrice);
 
-      outRows.push(outRow.concat([productName, brandName, unitPrice, boxPrice, label]));
+      // 写附加列（复用已有列位置，行不够长则补齐）
+      while (outRow.length < outHeaders.length) outRow.push('');
+      const extraVals = {
+        'ABWproductname': productName,
+        '品牌名': brandName,
+        '单价': unitPrice,
+        '整箱批发价': boxPrice,
+        '加购结果': label,
+      };
+      for (const name of extraColDefs) outRow[extraColIdx[name]] = extraVals[name];
+      outRows.push(outRow);
     }
 
     // 按 ABWproductname 列 A-Z 排序
-    const nameIdx = headers.length; // ABWproductname 在原始列之后
+    const nameIdx = extraColIdx['ABWproductname'];
     const headerRow = outRows.shift();
     outRows.sort((a, b) => {
       const va = String(a[nameIdx] || '').trim().toLowerCase();
@@ -1134,9 +1382,13 @@
     const blob = new Blob([buf], { type: 'application/octet-stream' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
-    a.href = url; a.download = '采购结果.xlsx'; document.body.appendChild(a); a.click();
+    a.href = url;
+    const now = new Date();
+    const pad = n => String(n).padStart(2, '0');
+    a.download = `采购结果_${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}_${pad(now.getHours())}${pad(now.getMinutes())}.xlsx`;
+    document.body.appendChild(a); a.click();
     document.body.removeChild(a); URL.revokeObjectURL(url);
-    log('📥 结果 Excel 已下载', 'success');
+    log('📥 结果 Excel 已下载（未执行行结果留空，可再次上传断点续跑）', 'success');
   }
 
   // 浏览器系统通知 + 标题闪烁
@@ -1199,6 +1451,7 @@
       },
       items: results.map(r => ({
         row: r.item._row,
+        rows: r.item._rows || [r.item._row],
         boxSku: r.item.boxSku,
         packaging: r.item.packaging,
         quantity: r.item.quantity,
@@ -1255,6 +1508,9 @@
     const file = e.target.files[0];
     if (!file) return;
 
+    // 开启新批次（总任务标识）：清旧批次 → 切新 runId → 存文件名，保证后续日志都写进新批次
+    startNewBatch(file.name);
+
     const wrap = document.getElementById('abw-file-wrap');
     const textEl = document.getElementById('abw-file-text');
 
@@ -1267,33 +1523,58 @@
     try {
       const buffer = await readFileAsArrayBuffer(file);
       const parsed = parseExcel(buffer);
-      const items = parsed.items;
+      const rawItems = parsed.items;
 
-      if (items.length === 0) {
+      // 断点续跑且全部已处理 → 不报错，提示无需再跑
+      const isAllDone = rawItems.length === 0
+        && parsed.resumeStats && parsed.resumeStats.hadResultCol
+        && parsed.resumeStats.doneCount > 0;
+      if (rawItems.length === 0 && !isAllDone) {
         throw new Error('未能解析出有效数据行，请确认列名是否匹配');
+      }
+      if (isAllDone) {
+        log('✅ 所有商品均已有加购结果，无需再跑（可直接下载结果 Excel）', 'success');
       }
 
       // 显示列映射，方便核对
       log(`📑 列映射: ${parsed.colMapLog.join(' | ')}`, 'info');
 
+      // 断点续跑提示：文件带"加购结果"列 → 已处理行已跳过
+      if (parsed.resumeStats && parsed.resumeStats.hadResultCol) {
+        const rs = parsed.resumeStats;
+        log(`🔁 断点续跑: 检测到"加购结果"列，已跳过已处理的 ${rs.doneCount} 行`, 'action');
+        log(`    ├ 成功/已在购物车: ${rs.successCount}  |  缺货: ${rs.skipCount}  |  失败: ${rs.failCount}`, 'info');
+        log(`    └ 本次仅加购 ${rawItems.length} 条未处理商品${rs.failCount > 0 ? '（如需重试失败行，请清空对应行的加购结果单元格）' : ''}`, 'info');
+      }
+
+      // 同 SKU 聚合：同一 SKU+包装 的多行（不同订单关联）合并为一次加购，数量求和
+      // 聚合只发生在执行层；下载结果时仍按原始行逐行回写（行数/列结构不变）
+      const items = mergeSameSkuItems(rawItems);
+
       // 存储解析结果 + 原始数据（下载结果时用）
-      // 新文件上传 → 清空旧日志
-      STORE.remove(K.logs);
+      // 旧批次日志已由 startNewBatch 清除，这里只清面板 DOM
       document.getElementById('abw-log').innerHTML = '';
       results.length = 0;
       STORE.set(K.items, items);
       STORE.set(K.xlHeaders, parsed.headers);
       STORE.set(K.xlRows, parsed.rawRows);
       STORE.set(K.batchNo, parsed.batchNo || '');
+      STORE.set(K.totalCount, items.length); // 本批次任务总数（进度条分母）
 
       // 显示任务列表
       renderTaskList(items);
 
-      document.getElementById('abw-start-btn').disabled = false;
+      // 有待跑任务才启用开始按钮（全部已处理时禁用）
+      document.getElementById('abw-start-btn').disabled = items.length === 0;
       document.getElementById('abw-clear-btn').disabled = false;
 
-      log(`解析完成！共 ${items.length} 条有效任务`, 'success');
-      log(`首条示例: SKU=${items[0].boxSku} | 规格=${items[0].packaging} | 数量=${items[0].quantity}`, 'info');
+      // 更新批次信息显示
+      updateBatchInfo();
+
+      if (items.length > 0) {
+        log(`解析完成！共 ${items.length} 条有效任务`, 'success');
+        log(`首条示例: SKU=${items[0].boxSku} | 规格=${items[0].packaging} | 数量=${items[0].quantity}`, 'info');
+      }
 
     } catch (err) {
       log(`解析失败: ${err.message}`, 'error');
@@ -1321,16 +1602,20 @@
     section.style.display = 'block';
     count.textContent = items.length;
 
-    list.innerHTML = items.map((item, i) => `
-      <div class="abw-task-item">
-        <span>#${i+1} <span class="sku">${item.boxSku}</span> | <span class="spec">${item.packaging}</span> × <span class="qty">${item.quantity}</span></span>
-        <span style="color:#666;font-size:10px;">Row${item._row}</span>
-      </div>
-    `).join('');
+    list.innerHTML = items.map((item, i) => {
+      const merged = item._rows && item._rows.length > 1;
+      const rowLabel = merged ? `Row${item._rows.join('+')}` : `Row${item._row}`;
+      return `
+        <div class="abw-task-item">
+          <span>#${i+1} <span class="sku">${item.boxSku}</span> | <span class="spec">${item.packaging}</span> × <span class="qty">${item.quantity}</span>${merged ? ` <span style="color:#2ecc71;font-size:10px;">(合并${item._rows.length}行)</span>` : ''}</span>
+          <span style="color:#666;font-size:10px;">${rowLabel}</span>
+        </div>
+      `;
+    }).join('');
   }
 
   function updateProgress(current, total) {
-    const pct = Math.round((current / total) * 100);
+    const pct = total > 0 ? Math.round((current / total) * 100) : 0;
     document.getElementById('abw-progress-bar').style.width = `${pct}%`;
   }
 
