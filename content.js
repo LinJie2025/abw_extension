@@ -1392,7 +1392,7 @@
         outRow[platformIdx] = [platform, region].filter(Boolean).join('-');
       }
       if (st === 'skipped') {
-        if (remarkIdx >= 0) outRow[remarkIdx] = '缺货';
+        if (remarkIdx >= 0) outRow[remarkIdx] = '缺货，请帮忙查询是否有库存供下单';
       } else if (st === 'success' && shipMap[i + 1]) {
         if (remarkIdx >= 0) outRow[remarkIdx] = '可能缺货';
       }
