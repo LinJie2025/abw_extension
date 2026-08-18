@@ -581,6 +581,19 @@
     return item._row ? [item._row] : [];
   }
 
+  // 结果去重：同一任务（按主行号 _row）只保留最后一条结果
+  // 兼容旧版本遗留的重复条目（navigating 跳页被重复 push，导致"已完成 N/总 M"虚高，如 14/7）
+  function dedupeResults(list) {
+    if (!list || list.length < 2) return list;
+    const map = new Map();
+    for (const r of list) {
+      const key = r && r.item && r.item._row;
+      if (key == null) continue;
+      map.set(key, r);
+    }
+    return [...map.values()];
+  }
+
   // ============================================================
   //  核心执行引擎
   // ============================================================
@@ -663,7 +676,8 @@
   }
 
   // 单条执行：SKU URL 直达商品页 → 检测加购按钮 → 设数量加购
-  async function executeItem(item, attempt = 1) {
+  // allItems/curIdx: 当前批次列表与索引，供 CF 挑战场景保存续跑点（页面 reload 后自动续跑）
+  async function executeItem(item, attempt = 1, allItems = null, curIdx = -1) {
     const { boxSku, innerRef, packaging, quantity, _row } = item;
     const addQty = quantity;
 
@@ -707,23 +721,48 @@
       await waitForPageReady();
 
       // ---- Cloudflare 安全验证检测（必须在 waitForProductPageReady 之前，避免商品页文本误匹配）----
-      let cfRetries = 0;
+      // 注意: location.reload() 会重建页面并重新注入脚本，内存计数随旧实例销毁而归零，
+      // 若 CF 持续不通过（挑战页保持原 URL）会陷入"检测→刷新→再检测"的无限循环，CF_TIMEOUT 永不触发。
+      // 因此把重试计数持久化到 sessionStorage，跨刷新保留。
+      const cfKey = 'abw_cf_' + boxSku;
       const cfMaxRetries = 5;
-      while (cfRetries < cfMaxRetries) {
-        const bodyText = document.body.innerText;
-        const isCF = /(checking your browser|just a moment|ddos protection|cf-browser-verification|please wait.*seconds)/i.test(bodyText)
-                  || /本网站使用安全服务/i.test(bodyText)  // Cloudflare 中文页面特征 短语
-                  || document.querySelector('#challenge-form, #cf-challenge-running, .cf-browser-verification');
-        if (!isCF) break;
+      let cfRetries = 0;
+      try { cfRetries = parseInt(sessionStorage.getItem(cfKey) || '0', 10) || 0; } catch (e) {}
+      const isCFPage = () => {
+        const text = (document.body && document.body.innerText) || '';
+        return /(checking your browser|just a moment|ddos protection|cf-browser-verification|本网站使用安全服务)/i.test(text)
+            || !!document.querySelector('#challenge-form, #cf-challenge-running, .cf-browser-verification');
+      };
+      if (isCFPage()) {
         cfRetries++;
+        try { sessionStorage.setItem(cfKey, String(cfRetries)); } catch (e) {}
         log(`  ⚠️ Cloudflare 安全验证 (${cfRetries}/${cfMaxRetries})，等待后重试...`, 'warn');
-        await sleep(5000);
-        location.reload();
-        await waitForPageReady();
-      }
-      if (cfRetries >= cfMaxRetries) {
-        log(`  ❌ Cloudflare 验证未通过，跳过此商品`, 'error');
-        return { status: 'failed', item, reason: ERRORS.CF_TIMEOUT };
+        if (cfRetries >= cfMaxRetries) {
+          try { sessionStorage.removeItem(cfKey); } catch (e) {}
+          log(`  ❌ Cloudflare 验证未通过，跳过此商品`, 'error');
+          return { status: 'failed', item, reason: ERRORS.CF_TIMEOUT };
+        }
+        // ★ 保存续跑点（当前条目及之后全部）：CF 挑战通过后页面会自动 reload，此时脚本实例被销毁、
+        // 无法走 runAll 的 navigating 返回路径保存 pending —— 若不在等待前主动保存，
+        // 新页面恢复时 pending 为空 → 落入「停止态等手动点击」，表现为"CF 通过后脚本不加购"。
+        // 保存后无论页面是自动 reload 还是下方手动 reload，新页面都会走「分支① 自动续跑」。
+        if (allItems && curIdx >= 0) {
+          STORE.set(K.pending, allItems.slice(curIdx));
+        }
+        // CF 的 JS 挑战通过后会自动刷新放行；先给 15s 让挑战自动完成（期间页面自动 reload 则旧实例随页面销毁自然终止），
+        // 仍未放行才强制 reload，并走 navigating 机制让新页面实例续跑（计数已持久化，不会被重置）
+        await sleep(15000);
+        if (isCFPage()) {
+          location.reload();
+          return { status: 'navigating', item };
+        }
+        // 挑战已通过且页面未自动 reload（内嵌 Turnstile 类验证）→ 清除本次续跑点，正常继续加购
+        if (allItems && curIdx >= 0) {
+          STORE.remove(K.pending);
+        }
+      } else {
+        // 页面已放行，清除历史计数
+        try { sessionStorage.removeItem(cfKey); } catch (e) {}
       }
 
       // ---- Step 1.1: 等待商品页关键元素就绪 ----
@@ -789,7 +828,7 @@
       if (attempt < CONFIG.behavior.retryCount) {
         log(`  🔄 重试中... (${attempt}/${CONFIG.behavior.retryCount})`, 'warn');
         await randomDelay();
-        return executeItem(item, attempt + 1);
+        return executeItem(item, attempt + 1, allItems, curIdx);
       }
       return { status: 'failed', item, reason: UNKNOWN_ERR, error: `[Row${_row}|${boxSku}] ${err.message}` };
     }
@@ -917,7 +956,7 @@
 
         let result;
         try {
-          result = await executeItem(items[i]);
+          result = await executeItem(items[i], 1, items, i);
         } catch (err) {
           // 用户点击「立即停止」：直接终止，不保存状态
           if (err === StopError) {
@@ -935,6 +974,11 @@
 
         // 如果是导航状态（页面跳转），保存剩余任务，新页面自动续跑
         if (result.status === 'navigating') {
+          // navigating 条目不进入 results：任务会在新页面重新执行并产生一条完成结果，
+          // 若此时 push 会导致同一任务两条结果 → "已完成 N/总 M" 虚高（如 14/7）
+          results.pop();
+          STORE.set(K.results, results);
+          updateProgress(results.length, total);
           STORE.set(K.pending, items.slice(i));
           STORE.set(K.results, results);
           // 校验保存是否成功，避免 sessionStorage 满导致跳转后无法续跑（表现为任务莫名中断）
@@ -1215,7 +1259,7 @@
     if (pendingItems && pendingItems.length > 0) {
       // ① 跳页中断：自动续跑（串行导航必需机制，保持不动）→ 进入运行态，显示「立即停止」
       STORE.remove(K.pending);
-      results.push(...savedResults);
+      results.push(...dedupeResults(savedResults));
       renderTaskList(pendingItems);
       document.getElementById('abw-start-btn').disabled = false;
       document.getElementById('abw-clear-btn').disabled = false;
@@ -1227,15 +1271,17 @@
       setRunning(false);
       if (savedResults.length > 0 && savedItems.length > 0) {
         // ② 同页执行中被刷新/中断：恢复结果 + 剩余列表 + 进度，手动开始
-        results.push(...savedResults);
+        // 先对存量结果去重（兼容旧版本 navigating 重复条目导致的虚高，如 14/7）
+        const restoredResults = dedupeResults(savedResults);
+        results.push(...restoredResults);
         const doneRows = new Set();
-        savedResults.forEach(r => resultRows(r).forEach(n => doneRows.add(n)));
+        restoredResults.forEach(r => resultRows(r).forEach(n => doneRows.add(n)));
         const remaining = savedItems.filter(it => !doneRows.has(it._row));
         renderTaskList(remaining.length > 0 ? remaining : savedItems);
         document.getElementById('abw-start-btn').disabled = remaining.length === 0;
         document.getElementById('abw-clear-btn').disabled = false;
-        updateProgress(savedResults.length, totalCount);
-        log(`⏸️ 检测到未完成批次：已完成 ${savedResults.length}/${totalCount}，剩余 ${remaining.length} 条待加购（点击「开始加购」继续）`, 'warn');
+        updateProgress(restoredResults.length, totalCount);
+        log(`⏸️ 检测到未完成批次：已完成 ${restoredResults.length}/${totalCount}，剩余 ${remaining.length} 条待加购（点击「开始加购」继续）`, 'warn');
         updateBatchInfo();
       } else {
         // ③ 全新 / 无未完成任务
