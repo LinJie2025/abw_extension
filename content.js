@@ -102,11 +102,33 @@
     get(key, fallback) {
       try { return JSON.parse(sessionStorage.getItem(realKey(key)) || 'null') ?? fallback; } catch (e) { return fallback; }
     },
+    // 直接写入；返回是否成功（不内部打日志，避免空间满时日志本身递归失败）
     set(key, val) {
-      try { sessionStorage.setItem(realKey(key), JSON.stringify(val)); } catch (e) {
+      try { sessionStorage.setItem(realKey(key), JSON.stringify(val)); return true; }
+      catch (e) {
         console.warn('[ABW] sessionStorage 写入失败，可能存储空间不足', key, e);
-        try { log(`⚠️ 存储空间不足，${key} 保存失败（请清理日志/重新上传Excel）`, 'error'); } catch (e2) {}
+        return false;
       }
+    },
+    // 带抢救的写入：首次失败 → 自动腾空间（清理可重建数据）→ 重试一次
+    // 返回是否最终成功。调用方（关键数据落盘处）应检查返回值并决定是否停止任务
+    setWithRetry(key, val) {
+      if (this.set(key, val)) return true;
+      try {
+        // ① 清理续跑点 pending（剩余任务可从 items 重建，可丢弃）
+        sessionStorage.removeItem(realKey(K.pending));
+        // ② 截断日志到最近 200 条（日志可重建，是最大占用）
+        const logsKey = realKey(K.logs);
+        const logs = JSON.parse(sessionStorage.getItem(logsKey) || '[]');
+        if (logs.length > 200) sessionStorage.setItem(logsKey, JSON.stringify(logs.slice(-200)));
+        // ③ 清理所有非当前批次的残留键（旧 runId 数据，腾出空间）
+        const keepPrefix = 'abw_run_' + currentRunId + '_';
+        for (let i = sessionStorage.length - 1; i >= 0; i--) {
+          const k = sessionStorage.key(i);
+          if (k && k.startsWith('abw_run_') && !k.startsWith(keepPrefix)) sessionStorage.removeItem(k);
+        }
+      } catch (e2) { /* 腾空间失败也继续尝试写入 */ }
+      return this.set(key, val);
     },
     remove(key) {
       try { sessionStorage.removeItem(realKey(key)); } catch (e) {}
@@ -408,7 +430,19 @@
   function parseExcel(buffer) {
     const workbook = XLSX.read(buffer, { type: 'array' });
     const sheet = workbook.Sheets[workbook.SheetNames[0]];
-    const rows = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: '' });
+
+    // 只展开实际有数据的行数：sheet 是稀疏存储（仅非空单元格有键），
+    // 先扫描最后一数据行，再按该范围展开，避免 !ref 全表范围（如 A1:M1048576）
+    // 展开出百万空行、生成几十 MB 数组，导致 abw_xl_rows 写入 sessionStorage 失败
+    let lastDataRow = 0;
+    for (const key of Object.keys(sheet)) {
+      if (!key || key[0] === '!') continue;
+      const m = key.match(/^([A-Z]+)(\d+)$/);
+      if (m) lastDataRow = Math.max(lastDataRow, parseInt(m[2], 10));
+    }
+    const origRange = XLSX.utils.decode_range(sheet['!ref'] || 'A1');
+    const range = `A1:${XLSX.utils.encode_col(origRange.e.c)}${Math.min(Math.max(lastDataRow, 1), origRange.e.r + 1)}`;
+    const rows = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: '', range });
 
     if (rows.length < 2) throw new Error('Excel 数据行不足');
 
@@ -747,7 +781,7 @@
         // 新页面恢复时 pending 为空 → 落入「停止态等手动点击」，表现为"CF 通过后脚本不加购"。
         // 保存后无论页面是自动 reload 还是下方手动 reload，新页面都会走「分支① 自动续跑」。
         if (allItems && curIdx >= 0) {
-          STORE.set(K.pending, allItems.slice(curIdx));
+          STORE.setWithRetry(K.pending, allItems.slice(curIdx));
         }
         // CF 的 JS 挑战通过后会自动刷新放行；先给 15s 让挑战自动完成（期间页面自动 reload 则旧实例随页面销毁自然终止），
         // 仍未放行才强制 reload，并走 navigating 机制让新页面实例续跑（计数已持久化，不会被重置）
@@ -947,6 +981,7 @@
     let stoppedByUser = false;
     let crashed = false;
     let navigating = false;
+    let storageFull = false; // 存储空间不足导致停止（已加购结果需抢救）
     try {
       for (let i = 0; i < items.length; i++) {
         if (forceStop) {
@@ -969,7 +1004,13 @@
         results.push(result);
         if (!results._startedAt) results._startedAt = _startedAt;
         // 实时落盘：每完成一条立即持久化，刷新后据此从断点恢复（方案成立的地基）
-        STORE.set(K.results, results);
+        // 保存失败（空间不足）时自动腾空间重试；仍失败则停止并抢救已加购结果
+        if (!STORE.setWithRetry(K.results, results)) {
+          storageFull = true;
+          log('⛔ 存储空间不足：结果保存失败，已停止任务！已加购结果已尽力保存。', 'error');
+          log('   请点击「下载结果Excel」保存进度 → 重新上传该文件即可断点续跑（已加购行自动跳过，无需清空购物车）', 'error');
+          break;
+        }
         updateProgress(results.length, total);
 
         // 如果是导航状态（页面跳转），保存剩余任务，新页面自动续跑
@@ -979,12 +1020,13 @@
           results.pop();
           STORE.set(K.results, results);
           updateProgress(results.length, total);
-          STORE.set(K.pending, items.slice(i));
-          STORE.set(K.results, results);
-          // 校验保存是否成功，避免 sessionStorage 满导致跳转后无法续跑（表现为任务莫名中断）
-          if (!STORE.get(K.pending, null)) {
-            log('⚠️ 剩余任务保存失败（sessionStorage 可能已满），跳转后将无法自动续跑！请清理日志后重试', 'error');
+          // 续跑点保存失败（空间不足）→ 停止并抢救，避免跳转后无法续跑（表现为任务莫名中断）
+          if (!STORE.setWithRetry(K.pending, items.slice(i))) {
+            storageFull = true;
+            log('⛔ 存储空间不足：剩余任务保存失败，已停止任务！请点击「下载结果Excel」→ 重新上传该文件断点续跑（无需清空购物车）', 'error');
+            break;
           }
+          STORE.set(K.results, results);
           navigating = true;
           break;
         }
@@ -1008,7 +1050,19 @@
       // 任务结束/停止/异常 → 恢复为「开始加购」态
       setRunning(false);
 
-      if (stoppedByUser) {
+      if (storageFull) {
+        // 空间不足停止：已加购结果已尽力落盘，展示下载按钮，引导用户下载→重传→续跑
+        document.getElementById('abw-dl-btn').style.display = '';
+        const logEntries = STORE.get(K.logs, []);
+        document.getElementById('abw-log-btn').style.display = logEntries.length > 0 ? '' : 'none';
+        showSummary(results);
+        log('⛔ 任务已停止（存储空间不足）', 'error');
+        log('下一步操作：', 'info');
+        log('  ① 点击「下载结果Excel」→ 保存已加购进度（已加购行会标结果）', 'info');
+        log('  ② 重新上传刚下载的文件 → 脚本自动跳过已加购行，只处理剩余商品', 'info');
+        log('  ③ 无需清空购物车，已加购的商品不会重复加购', 'info');
+        notifyComplete();
+      } else if (stoppedByUser) {
         log('⏹️ 已停止', 'warn');
         notifyComplete();
       } else if (crashed) {
@@ -1603,9 +1657,16 @@
       results.length = 0;
       STORE.set(K.items, items);
       STORE.set(K.xlHeaders, parsed.headers);
-      STORE.set(K.xlRows, parsed.rawRows);
+      const xlRowsSaved = STORE.setWithRetry(K.xlRows, parsed.rawRows);
       STORE.set(K.batchNo, parsed.batchNo || '');
       STORE.set(K.totalCount, items.length); // 本批次任务总数（进度条分母）
+
+      // 原始行数据保存失败 → 下载功能将不可用，必须在此拦截，避免"加购完才发现下载不了"
+      if (!xlRowsSaved) {
+        document.getElementById('abw-start-btn').disabled = true;
+        log('⛔ 原始Excel数据保存失败（存储空间不足）：已阻止加购。请先点击「下载日志」，再清理浏览器存储（或关闭并重开标签页）后重新上传', 'error');
+        throw new Error('存储空间不足，原始Excel数据保存失败；请清理浏览器存储（或关闭并重开标签页）后重新上传');
+      }
 
       // 显示任务列表
       renderTaskList(items);
