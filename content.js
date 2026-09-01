@@ -32,6 +32,14 @@
       closeBtnText: 'CLOSE',
       // 商品页面上显示的 UPC / Catalog No
       upcElement: '[class*="upc"], [class*="UPC"], [class*="catalog"]',
+      // 「Select size or color」触发器（多规格商品页面上的 div[ng-click=showProductOptionsDialog]）
+      selectSizeTrigger: '[ng-click*="showProductOptionsDialog"]',
+      // 规格弹窗（Angular Material md-dialog）
+      selectSizeDialog: 'md-dialog, [role="dialog"], .md-dialog-container, .md-dialog',
+      // 弹窗内规格选项按钮（ng-click 选择规格）
+      dialogOptionBtn: 'button[ng-click*="onSelectProductOption"]',
+      // 弹窗内 ADD TO BAG 按钮
+      dialogAddToBagBtn: 'button[ng-click*="onAddSelectedProductOptionToBag"]',
     },
 
     // 行为参数
@@ -40,6 +48,7 @@
       delayMax: 4000,       // 操作间最大延迟 (ms)
       pageLoadTimeout: 8000,// 页面加载超时 (ms)
       modalWaitTimeout: 8000, // 等待加购弹窗超时 (ms)
+      optionWaitTimeout: 8000, // 点击规格选项后等待后台页面刷新 UPC 的超时 (ms)
       retryCount: 2,        // 单条失败重试次数
       mergeSameSku: true,   // 同一 SKU+包装 的多行（不同订单关联）合并为一次加购，数量求和
     },
@@ -647,32 +656,39 @@
   // 启动时读取持久化标识（跳页续跑时保持运行态，恢复逻辑会据 pending 再校正）
   isRunning = (() => { try { return sessionStorage.getItem(RUNNING_KEY) === '1'; } catch (e) { return false; } })();
 
+  // 设置页面数量输入框（值相同则跳过）
+  async function setQty(addQty) {
+    const qtyInput = await waitFor(CONFIG.selectors.qtyInput, 3000);
+    if (!qtyInput) {
+      log(`  ⚠️ 未找到数量输入框，使用默认数量`, 'warn');
+      return;
+    }
+    const target = String(addQty);
+    if (qtyInput.value === target) return; // 已是目标值，避免多余事件刷新
+    qtyInput.focus();
+    qtyInput.select();
+    const nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+    nativeInputValueSetter.call(qtyInput, target);
+    qtyInput.dispatchEvent(new Event('input', { bubbles: true }));
+    qtyInput.dispatchEvent(new Event('change', { bubbles: true }));
+    await sleep(500);
+  }
+
   // 加购后半段（设数量 → 点击 → 校验弹窗）
   async function doAddToBag(_addBtn, item, addQty) {
     // Step 5: 设置数量
     log(`  → 设置数量: ${addQty}`, 'info');
-    const qtyInput = await waitFor(CONFIG.selectors.qtyInput, 3000);
-    if (qtyInput) {
-      qtyInput.focus();
-      qtyInput.select();
-      const nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
-      nativeInputValueSetter.call(qtyInput, String(addQty));
-      qtyInput.dispatchEvent(new Event('input', { bubbles: true }));
-      qtyInput.dispatchEvent(new Event('change', { bubbles: true }));
-      await sleep(500);
-    } else {
-      log(`  ⚠️ 未找到数量输入框，使用默认数量`, 'warn');
-    }
+    await setQty(addQty);
     // Step 6: 重新查找加购按钮（设数量后 Angular 可能替换了 DOM）
     const addBtn = await findAddToBagButton();
     if (!addBtn) throw new Error('设数量后找不到加购按钮');
     log(`  → 点击加购...`, 'info');
     addBtn.click();
     await sleep(1000);
-    // Step 7: 检测是否弹出 "Select size or color" 弹窗（需人工选择规格）
+    // Step 7: 检测是否弹出 "Select size or color" 弹窗（遍历规格选项，按 UPC 匹配加购）
     if (isSelectSizeDialogOpen()) {
-      log(`  ⚠️ 检测到 "Select size or color" 弹窗，暂未支持该加购类型`, 'warn');
-      return { status: 'failed', item, reason: ERRORS.UNSUPPORTED_TYPE };
+      log(`  ⚠️ 检测到 "Select size or color" 弹窗，开始遍历规格选项匹配 UPC...`, 'warn');
+      return await trySelectOptionAdd(item, addQty);
     }
     // Step 8: 等待弹窗并校验
     log(`  → 等待加购结果...`, 'info');
@@ -811,9 +827,13 @@
       }
 
       // ---- Step 3: 校验 UPC ----
+      // 多规格商品（页面上有 "Select size or color" 触发器）跳过页面 UPC 预检，
+      // 由规格弹窗流程（trySelectOptionAdd）逐个选项匹配 UPC；
+      // 单规格商品保持原有页面 UPC 校验
+      const hasOptionTrigger = !!findSelectSizeTrigger();
       const pageText = document.body.innerText;
       const upcMatch = pageText.match(/UPC[:\s]*(\d[\d\s-]{8,})/i);
-      if (upcMatch) {
+      if (!hasOptionTrigger && upcMatch) {
         const pageUpc = upcMatch[1].replace(/\s/g, '');
         const refClean = innerRef.replace(/\s/g, '');
         if (refClean && !pageUpc.includes(refClean) && !refClean.includes(pageUpc)) {
@@ -949,6 +969,237 @@
     return false;
   }
 
+  // ============================================================
+  //  多规格商品加购（Select size or color 弹窗）
+  //  流程：点击弹窗内选项 → 后台页面 More Information 表格同步刷新 →
+  //        提取 UPC(13位纯数字) 与 Excel 内部参考号比对 → 匹配则加购；
+  //        全部选项无匹配 → 标记缺货
+  // ============================================================
+
+  // 查找页面上的 "Select size or color" 触发器（多规格商品才有）
+  // 实测触发器是 div[ng-click="showProductOptionsDialog()"]（不是 <button>），
+  // 已选中规格后其文本变为 "#25 Warm Beige x 6 ▼"，ng-click 保持不变
+  function findSelectSizeTrigger() {
+    const byNg = document.querySelector(CONFIG.selectors.selectSizeTrigger);
+    if (byNg && isElementReal(byNg, true)) return byNg;
+    // 兜底：文本匹配（button/div/span 都查）
+    const els = document.querySelectorAll('button, div, span, a');
+    for (const b of els) {
+      if (!isElementReal(b, true)) continue;
+      const t = (b.textContent || '').trim();
+      if (/^select size or color$/i.test(t)) return b;
+      if (/^#\d+/.test(t) && /▼/.test(t)) return b;
+    }
+    return null;
+  }
+
+  // 查找可见的 "Select size or color" 弹窗元素
+  function findSelectSizeDialog() {
+    const dialogs = document.querySelectorAll(CONFIG.selectors.selectSizeDialog);
+    for (const d of dialogs) {
+      if (d.offsetParent === null) continue; // 不可见
+      const text = (d.innerText || '').toLowerCase();
+      if (text.includes('select size') || text.includes('select color')) return d;
+    }
+    return null;
+  }
+
+  // 从 More Information 表格中按行标题取数值（UPC / Catalog No.）
+  // ① 优先在包含 "More Information" 标题的表格中查找；② 兜底全局查找首个匹配行
+  function extractDetailsRow(labelRe) {
+    const tables = document.querySelectorAll('table');
+    for (const table of tables) {
+      const rows = table.querySelectorAll('tr');
+      const hasSection = [...rows].some(r =>
+        [...r.querySelectorAll('td,th')].some(c => /^more information$/i.test((c.textContent || '').trim()))
+      );
+      if (!hasSection) continue;
+      for (const row of rows) {
+        const cells = [...row.querySelectorAll('td')];
+        if (cells.length < 2) continue;
+        if (labelRe.test((cells[0].textContent || '').trim())) {
+          return (cells[1].textContent || '').trim();
+        }
+      }
+    }
+    // 兜底：全局查找首个匹配行标题的 td（无 "More Information" 标题的表格）
+    const tds = document.querySelectorAll('td');
+    for (const td of tds) {
+      if (labelRe.test((td.textContent || '').trim())) {
+        const cells = [...td.parentElement.querySelectorAll('td')];
+        if (cells.length >= 2) return (cells[1].textContent || '').trim();
+      }
+    }
+    return '';
+  }
+
+  // 提取页面 More Information 中的 UPC 值（13位纯数字，兼容 "8800287116256 x 6" 格式）
+  function extractUpcFromDetails() {
+    const raw = extractDetailsRow(/^upc$/i);
+    if (!raw) return null;
+    const m = raw.match(/\b\d{13}\b/);
+    return { raw, upc13: m ? m[0] : '' };
+  }
+
+  // 提取页面 More Information 中的 Catalog No.（用于判断选项点击后页面是否已刷新）
+  function extractCatalogNoFromDetails() {
+    return extractDetailsRow(/^catalog\s*no\.?$/i);
+  }
+
+  // Excel 内部参考号 → 13位 UPC（兼容 "8800287116256 x 6" 或纯13位数字）
+  function extractRefUpc(innerRef) {
+    const m = String(innerRef || '').match(/\b\d{13}\b/);
+    return m ? m[0] : '';
+  }
+
+  // 获取规格弹窗内的选项名称列表（只取名称；按钮每次点击前重新定位，见 findDialogOptionBtn）
+  function getDialogOptionLabels(dialog) {
+    const labels = [];
+    const items = dialog.querySelectorAll('md-list-item');
+    for (const item of items) {
+      const btn = item.querySelector(CONFIG.selectors.dialogOptionBtn);
+      if (!btn) continue;
+      // 选项名在 .infoCol 里的 span（如 "#25 Warm Beige x 6"），按钮自身文本为空
+      const span = [...item.querySelectorAll('span')].find(s => /^#\d+/.test((s.textContent || '').trim()));
+      labels.push(span ? span.textContent.trim()
+        : (btn.getAttribute('aria-label') || item.textContent || '').trim().split('\n')[0].trim());
+    }
+    if (labels.length > 0) return labels;
+    // 兜底：直接找选项按钮取名称
+    return [...dialog.querySelectorAll(CONFIG.selectors.dialogOptionBtn)].map(btn =>
+      (btn.textContent || '').trim() || (btn.getAttribute('aria-label') || '').trim().split('\n')[0].trim());
+  }
+
+  // 按选项名称在弹窗内重新定位选项按钮（返回新鲜引用）
+  // 关键：Angular 选中一个选项后会重渲染弹窗 DOM，之前缓存的按钮引用会失效（isConnected=false），
+  // 点击无效；因此每次点击前必须重新定位
+  function findDialogOptionBtn(dialog, label) {
+    const items = dialog.querySelectorAll('md-list-item');
+    for (const item of items) {
+      const btn = item.querySelector(CONFIG.selectors.dialogOptionBtn);
+      if (!btn) continue;
+      const span = [...item.querySelectorAll('span')].find(s => /^#\d+/.test((s.textContent || '').trim()));
+      const itemLabel = span ? span.textContent.trim()
+        : (btn.getAttribute('aria-label') || item.textContent || '').trim().split('\n')[0].trim();
+      if (itemLabel === label) return btn;
+    }
+    // 兜底：直接匹配按钮文本
+    return [...dialog.querySelectorAll(CONFIG.selectors.dialogOptionBtn)].find(btn =>
+      (btn.textContent || '').trim() === label
+      || ((btn.getAttribute('aria-label') || '').trim().split('\n')[0].trim() === label)) || null;
+  }
+
+  // 点击选项后等待后台页面刷新（UPC 或 Catalog No. 与点击前不同）
+  async function waitForDetailsRefresh(prevSignal, timeout = 8000) {
+    const start = Date.now();
+    while (Date.now() - start < timeout) {
+      checkStop();
+      const upc = extractUpcFromDetails();
+      const upc13 = upc ? upc.upc13 : '';
+      const catalog = extractCatalogNoFromDetails();
+      if (upc13 && upc13 !== prevSignal.upc13) return true;
+      if (catalog && catalog !== prevSignal.catalog) return true;
+      await sleep(300);
+    }
+    return false;
+  }
+
+  // 规格弹窗加购：依次点击选项 → 比对 UPC → 匹配则加购；全部不匹配 → 缺货
+  async function trySelectOptionAdd(item, addQty) {
+    const dialog = findSelectSizeDialog();
+    if (!dialog) throw new Error('规格弹窗已消失');
+    const optionLabels = getDialogOptionLabels(dialog);
+    const refUpc = extractRefUpc(item.innerRef);
+    log(`  ℹ️ 规格弹窗共 ${optionLabels.length} 个选项 | Excel内部参考号=${item.innerRef || '(空)'}${refUpc ? ` → UPC=${refUpc}` : ''}`, 'info');
+    if (optionLabels.length === 0) {
+      log('  ⚠️ 弹窗内未找到规格选项，标记缺货', 'warn');
+      return { status: 'skipped', item, reason: ERRORS.OUT_OF_STOCK };
+    }
+
+    // ① 若当前已有选中规格（历史状态），先直接比对
+    const cur = extractUpcFromDetails();
+    if (cur && cur.upc13) {
+      if (refUpc && cur.upc13 === refUpc) {
+        log(`  ✅ 当前规格 UPC=${cur.upc13} 与内部参考号匹配，直接加购`, 'success');
+        return await clickDialogAddToBag(item, addQty);
+      }
+      log(`  ⚠️ 当前规格 UPC=${cur.upc13} 不匹配，继续遍历其他选项`, 'info');
+    }
+
+    // ② 依次点击选项，等待后台刷新后读取 UPC 比对
+    // 注意：Angular 选中选项后会重渲染弹窗 DOM，按钮引用会失效，
+    // 因此每次点击前都用 findDialogOptionBtn 重新定位（实测修复后 8/8 选项均可点击）
+    let prevSignal = {
+      upc13: cur ? cur.upc13 : '',
+      catalog: extractCatalogNoFromDetails() || '',
+    };
+    for (let i = 0; i < optionLabels.length; i++) {
+      const label = optionLabels[i];
+      log(`  → 点击选项 ${i + 1}/${optionLabels.length}: ${label}`, 'info');
+      let btn = findDialogOptionBtn(dialog, label);
+      if (!btn) {
+        log(`  ⚠️ ${label}: 未找到选项按钮，尝试下一选项`, 'warn');
+        continue;
+      }
+      btn.click();
+      let refreshed = await waitForDetailsRefresh(prevSignal, CONFIG.behavior.optionWaitTimeout);
+      if (!refreshed) {
+        // 重试一次：重新定位（Angular 可能仍在重渲染）后再点击
+        const btn2 = findDialogOptionBtn(dialog, label);
+        if (btn2 && btn2 !== btn) {
+          log(`  ↻ ${label}: 重新定位按钮后重试点击...`, 'info');
+          btn2.click();
+          refreshed = await waitForDetailsRefresh(prevSignal, CONFIG.behavior.optionWaitTimeout);
+        }
+      }
+      prevSignal = {
+        upc13: (extractUpcFromDetails() || {}).upc13 || '',
+        catalog: extractCatalogNoFromDetails() || '',
+      };
+      if (!refreshed) {
+        log(`  ⚠️ ${label}: 页面信息刷新超时，尝试下一选项`, 'warn');
+        continue;
+      }
+      const upc13 = prevSignal.upc13;
+      if (!upc13) {
+        log(`  ⚠️ ${label}: 未提取到 UPC（More Information 无 UPC 行）`, 'warn');
+        continue;
+      }
+      if (refUpc && upc13 === refUpc) {
+        log(`  ✅ ${label}: UPC=${upc13} 匹配！开始加购`, 'success');
+        item._selectedOption = label;
+        return await clickDialogAddToBag(item, addQty);
+      }
+      log(`  ❌ ${label}: UPC=${upc13}${refUpc ? ` ≠ 期望 ${refUpc}` : '（Excel无13位UPC，无法匹配）'}`, 'warn');
+    }
+
+    // ③ 全部选项无匹配 → 缺货
+    log('  🚫 所有规格选项均已点击且无 UPC 匹配，标记缺货', 'warn');
+    return { status: 'skipped', item, reason: ERRORS.OUT_OF_STOCK };
+  }
+
+  // 点击规格弹窗内的 ADD TO BAG 并校验成功弹窗
+  async function clickDialogAddToBag(item, addQty) {
+    const dialog = findSelectSizeDialog();
+    if (!dialog) throw new Error('规格弹窗已消失');
+    // 关键：数量绑定在 selectedProductOption.quantity 上，切换选项会替换对象导致数量重置为 1，
+    // 因此必须「先匹配到目标选项、再重设数量」，最后才点弹窗 ADD TO BAG
+    log(`  → 重设数量: ${addQty}`, 'info');
+    await setQty(addQty);
+    const btn = dialog.querySelector(CONFIG.selectors.dialogAddToBagBtn)
+      || [...dialog.querySelectorAll('button')].find(b => /add\s*to\s*b[ao]g/i.test((b.textContent || '').trim()));
+    if (!btn) throw new Error('规格弹窗内未找到 ADD TO BAG 按钮');
+    log('  → 点击弹窗内 ADD TO BAG...', 'info');
+    btn.click();
+    await sleep(1000);
+    const success = await waitForSuccessModal();
+    if (!success) throw new Error('超时未检测到加购成功弹窗');
+    await closeModal();
+    await randomDelay();
+    log('  ✅ 加购成功!', 'success');
+    return { status: 'success', item };
+  }
+
   // 关闭弹窗
   async function closeModal() {
     // 查找 CLOSE 按钮
@@ -977,6 +1228,7 @@
 
     log(`🚀 开始执行，共 ${items.length} 条任务`, 'action');
     updateProgress(results.length, total);
+    updateBatchInfo(); // 继续模式时已有历史结果，header 同步
 
     let stoppedByUser = false;
     let crashed = false;
@@ -1012,6 +1264,8 @@
           break;
         }
         updateProgress(results.length, total);
+        updateBatchInfo();                       // 批次 header 实时刷新（已完成 N / 总 M）
+        renderTaskList(items.slice(i + 1));      // 已完成的从任务列表移除（剩余待办）
 
         // 如果是导航状态（页面跳转），保存剩余任务，新页面自动续跑
         if (result.status === 'navigating') {
@@ -1020,6 +1274,8 @@
           results.pop();
           STORE.set(K.results, results);
           updateProgress(results.length, total);
+          updateBatchInfo();                     // 跳页前同步 header（navigating 结果不计入已完成）
+          renderTaskList(items.slice(i + 1));    // 剩余任务列表随新页面续跑展示
           // 续跑点保存失败（空间不足）→ 停止并抢救，避免跳转后无法续跑（表现为任务莫名中断）
           if (!STORE.setWithRetry(K.pending, items.slice(i))) {
             storageFull = true;
@@ -1208,7 +1464,7 @@
         <!-- 汇总 -->
         <div id="abw-summary"></div>
       </div>
-      <div id="abw-footer">ABW Auto Purchase v1.10.2 · 数据不出浏览器 · 跨页面保持</div>
+      <div id="abw-footer">ABW Auto Purchase v1.11.4 · 数据不出浏览器 · 跨页面保持</div>
     `;
     document.body.appendChild(panel);
 
@@ -1276,6 +1532,7 @@
         toRun = items.filter(it => !doneRows.has(it._row));
         if (toRun.length === 0) {
           log('✅ 所有任务均已完成，无需再跑', 'success');
+          renderTaskList([]); // 全部完成 → 任务列表隐藏
           setRunning(false);
           return;
         }
@@ -1331,12 +1588,20 @@
         const doneRows = new Set();
         restoredResults.forEach(r => resultRows(r).forEach(n => doneRows.add(n)));
         const remaining = savedItems.filter(it => !doneRows.has(it._row));
-        renderTaskList(remaining.length > 0 ? remaining : savedItems);
-        document.getElementById('abw-start-btn').disabled = remaining.length === 0;
-        document.getElementById('abw-clear-btn').disabled = false;
         updateProgress(restoredResults.length, totalCount);
-        log(`⏸️ 检测到未完成批次：已完成 ${restoredResults.length}/${totalCount}，剩余 ${remaining.length} 条待加购（点击「开始加购」继续）`, 'warn');
         updateBatchInfo();
+        if (remaining.length === 0) {
+          // 批次已全部完成：只恢复结果与进度，不提示「未完成批次」
+          renderTaskList([]); // 空列表 → 任务列表隐藏
+          document.getElementById('abw-start-btn').disabled = true;
+          document.getElementById('abw-clear-btn').disabled = false;
+          log(`✅ 检测到已完成批次：已完成 ${restoredResults.length}/${totalCount}，无剩余任务`, 'success');
+        } else {
+          renderTaskList(remaining);
+          document.getElementById('abw-start-btn').disabled = false;
+          document.getElementById('abw-clear-btn').disabled = false;
+          log(`⏸️ 检测到未完成批次：已完成 ${restoredResults.length}/${totalCount}，剩余 ${remaining.length} 条待加购（点击「开始加购」继续）`, 'warn');
+        }
       } else {
         // ③ 全新 / 无未完成任务
         if (savedItems.length > 0) {
@@ -1706,6 +1971,11 @@
     const list = document.getElementById('abw-task-list');
     const count = document.getElementById('abw-task-count');
 
+    // 无剩余任务 → 隐藏任务列表（避免完成后最后一个任务残留）
+    if (!items || items.length === 0) {
+      section.style.display = 'none';
+      return;
+    }
     section.style.display = 'block';
     count.textContent = items.length;
 

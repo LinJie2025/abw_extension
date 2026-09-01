@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "ABW Auto Purchase",
-  "version": "1.0.7",
+  "version": "1.11.1",
   "description": "AsianBeautyWholesale 自动加购 — 上传采购Excel一键逐条加购到购物车",
   "icons": {
     "16": "favicon-32x32.png",
