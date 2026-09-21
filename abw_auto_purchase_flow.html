@@ -1,0 +1,289 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ABW 自动加购 · 业务功能流程图</title>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js" integrity="sha384-ZZ1pncU3bQe8y31yfZdMFdSpttDoPmOZg2wguVK9almUodir1PghgT0eY7Mrty8H" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/jspdf@2.5.2/dist/jspdf.umd.min.js" integrity="sha384-en/ztfPSRkGfME4KIm05joYXynqzUgbsG5nMrj/xEFAHXkeZfO3yMK8QQ+mP7p1/" crossorigin="anonymous"></script>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: #fbf9f4;
+    color: #3b4252;
+    font-family: 'JetBrains Mono', monospace;
+    min-height: 100vh;
+    padding: 32px 20px;
+  }
+  #report-container { max-width: 1040px; margin: 0 auto; }
+  .header {
+    display: flex; align-items: center; justify-content: space-between;
+    margin-bottom: 20px; flex-wrap: wrap; gap: 12px;
+  }
+  .title-wrap { display: flex; align-items: center; gap: 12px; }
+  .pulse-dot {
+    width: 11px; height: 11px; border-radius: 50%;
+    background: #5ec4b6; box-shadow: 0 0 0 0 rgba(94,196,182,0.7);
+    animation: pulse 2s infinite;
+  }
+  @keyframes pulse {
+    0% { box-shadow: 0 0 0 0 rgba(94,196,182,0.6); }
+    70% { box-shadow: 0 0 0 10px rgba(94,196,182,0); }
+    100% { box-shadow: 0 0 0 0 rgba(94,196,182,0); }
+  }
+  h1 { font-size: 20px; font-weight: 700; color: #2e3440; letter-spacing: -0.5px; }
+  .subtitle { font-size: 11px; color: #8a8f99; margin-top: 4px; }
+  .toolbar { position: relative; }
+  .toolbar-toggle {
+    background: #ffffff; border: 1px solid #e3ddd0; color: #8a8f99;
+    border-radius: 8px; width: 36px; height: 32px; cursor: pointer; font-size: 16px;
+    box-shadow: 0 1px 2px rgba(0,0,0,0.04);
+  }
+  .toolbar-actions {
+    display: none; position: absolute; right: 0; top: 38px; background: #ffffff;
+    border: 1px solid #e3ddd0; border-radius: 8px; padding: 6px; z-index: 10; min-width: 130px;
+    box-shadow: 0 4px 14px rgba(0,0,0,0.08);
+  }
+  .toolbar-actions.show { display: block; }
+  .toolbar-actions button {
+    display: block; width: 100%; text-align: left; background: none; border: none;
+    color: #5b6675; padding: 7px 10px; font-size: 11px; cursor: pointer; border-radius: 5px;
+    font-family: 'JetBrains Mono', monospace;
+  }
+  .toolbar-actions button:hover { background: #f3f7f6; color: #5ec4b6; }
+  .diagram-card {
+    background: #ffffff; border: 1px solid #ece6da; border-radius: 14px;
+    padding: 16px; overflow-x: auto; box-shadow: 0 2px 10px rgba(120,110,90,0.05);
+  }
+  .legend { display: flex; flex-wrap: wrap; gap: 14px; margin-top: 14px; padding: 0 6px; }
+  .legend-item { display: flex; align-items: center; gap: 6px; font-size: 10px; color: #8a8f99; }
+  .legend-swatch { width: 14px; height: 14px; border-radius: 4px; }
+  .cards { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; margin-top: 22px; }
+  .card {
+    background: #ffffff; border: 1px solid #ece6da; border-radius: 12px; padding: 16px;
+    box-shadow: 0 2px 8px rgba(120,110,90,0.04);
+  }
+  .card-header { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
+  .card-dot { width: 9px; height: 9px; border-radius: 50%; }
+  .card h3 { font-size: 12px; font-weight: 600; color: #2e3440; }
+  .card ul { list-style: none; font-size: 10px; color: #7a8190; line-height: 1.7; }
+  .card li::before { content: "• "; color: #c9c2b3; }
+  .footer { text-align: center; font-size: 9px; color: #b3ad9f; margin-top: 22px; }
+  @media print { .toolbar { display: none !important; } }
+</style>
+</head>
+<body>
+<div id="report-container">
+  <div class="header">
+    <div class="title-wrap">
+      <div class="pulse-dot"></div>
+      <div>
+        <h1>ABW 自动加购 · 业务功能流程图</h1>
+        <div class="subtitle">content.js · 上传采购 Excel → 逐条加购 → 断点恢复 → 结果导出 · 版本 v1.11.1</div>
+      </div>
+    </div>
+    <div class="toolbar">
+      <button class="toolbar-toggle" id="tb-toggle" title="导出">⋯</button>
+      <div class="toolbar-actions" id="tb-actions">
+        <button onclick="copyAsImage()">📋 复制 PNG</button>
+        <button onclick="downloadPNG()">🖼️ 下载 PNG</button>
+        <button onclick="downloadPDF()">📄 下载 PDF</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="diagram-card">
+    <svg viewBox="0 0 1000 1200" xmlns="http://www.w3.org/2000/svg" font-family="'JetBrains Mono', monospace">
+      <defs>
+        <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse">
+          <path d="M 40 0 L 0 0 0 40" fill="none" stroke="#efe9dd" stroke-width="0.5"/>
+        </pattern>
+        <marker id="arrowhead" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+          <polygon points="0 0, 10 3.5, 0 7" fill="#b0a896" />
+        </marker>
+        <marker id="arrowhead-pink" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+          <polygon points="0 0, 10 3.5, 0 7" fill="#ef8aa9" />
+        </marker>
+        <marker id="arrowhead-apricot" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+          <polygon points="0 0, 10 3.5, 0 7" fill="#f0a868" />
+        </marker>
+        <marker id="arrowhead-lav" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+          <polygon points="0 0, 10 3.5, 0 7" fill="#9b8bd4" />
+        </marker>
+      </defs>
+
+      <rect x="0" y="0" width="1000" height="1200" fill="url(#grid)"/>
+
+      <!-- ===== connector arrows ===== -->
+      <line x1="500" y1="96" x2="500" y2="120" stroke="#b0a896" stroke-width="1.5" marker-end="url(#arrowhead)"/>
+      <line x1="500" y1="202" x2="500" y2="232" stroke="#b0a896" stroke-width="1.5" marker-end="url(#arrowhead)"/>
+      <line x1="500" y1="322" x2="500" y2="350" stroke="#b0a896" stroke-width="1.5" marker-end="url(#arrowhead)"/>
+      <line x1="500" y1="416" x2="500" y2="442" stroke="#b0a896" stroke-width="1.5" marker-end="url(#arrowhead)"/>
+      <line x1="500" y1="592" x2="500" y2="622" stroke="#b0a896" stroke-width="1.5" marker-end="url(#arrowhead)"/>
+      <line x1="500" y1="712" x2="500" y2="742" stroke="#b0a896" stroke-width="1.5" marker-end="url(#arrowhead)"/>
+      <line x1="500" y1="822" x2="500" y2="852" stroke="#b0a896" stroke-width="1.5" marker-end="url(#arrowhead)"/>
+      <line x1="500" y1="942" x2="500" y2="962" stroke="#b0a896" stroke-width="1.5" marker-end="url(#arrowhead)"/>
+      <line x1="500" y1="1052" x2="500" y2="1082" stroke="#b0a896" stroke-width="1.5" marker-end="url(#arrowhead)"/>
+
+      <!-- D3 NO -> back to N3 -->
+      <path d="M 400 895 C 230 895 230 384 348 384" fill="none" stroke="#ef8aa9" stroke-width="1.5" stroke-dasharray="5,4" marker-end="url(#arrowhead-pink)"/>
+      <!-- D2 retry -> back to N4 -->
+      <path d="M 400 665 C 250 665 250 516 308 516" fill="none" stroke="#f0a868" stroke-width="1.5" stroke-dasharray="5,4" marker-end="url(#arrowhead-apricot)"/>
+      <!-- D2 navigating -> note -->
+      <path d="M 600 665 L 716 665" fill="none" stroke="#9b8bd4" stroke-width="1.5" stroke-dasharray="5,4" marker-end="url(#arrowhead-lav)"/>
+
+      <!-- ===== NODES ===== -->
+
+      <!-- N1 start (teal) -->
+      <rect x="330" y="32" width="340" height="64" rx="32" fill="#e0f7f4" stroke="#5ec4b6" stroke-width="1.5"/>
+      <text x="500" y="58" fill="#2c7a70" font-size="13" font-weight="600" text-anchor="middle">① 用户上传采购 Excel</text>
+      <text x="500" y="78" fill="#6b8f8a" font-size="9" text-anchor="middle">拖拽 / 选择文件 · 站点 asianbeautywholesale.com</text>
+
+      <!-- N2 parse & batch (mint) -->
+      <rect x="310" y="120" width="380" height="82" rx="6" fill="#e3f6e5" stroke="#6cc47f" stroke-width="1.5"/>
+      <text x="500" y="146" fill="#3f8c52" font-size="12" font-weight="600" text-anchor="middle">② 解析 &amp; 生成批次</text>
+      <text x="500" y="166" fill="#6a8a72" font-size="9" text-anchor="middle">startNewBatch(runId) · 清旧批次</text>
+      <text x="500" y="184" fill="#6a8a72" font-size="9" text-anchor="middle">parseExcel(列映射) · mergeSameSkuItems(同SKU合并)</text>
+
+      <!-- D1 recovery decision (rose) -->
+      <polygon points="500,232 600,277 500,322 400,277" fill="#fce4ec" stroke="#ef8aa9" stroke-width="1.5"/>
+      <text x="500" y="272" fill="#c45a7e" font-size="11" font-weight="600" text-anchor="middle">③ 恢复判定</text>
+      <text x="500" y="289" fill="#a87a8a" font-size="8.5" text-anchor="middle">刷新/跳页后</text>
+      <text x="500" y="356" fill="#a87a8a" font-size="8.5" text-anchor="middle">全新 / 续跑 → runAll</text>
+
+      <!-- N3 runAll loop (apricot) -->
+      <rect x="310" y="350" width="380" height="66" rx="6" fill="#fdeede" stroke="#f0a868" stroke-width="1.5"/>
+      <text x="500" y="375" fill="#c47d35" font-size="12" font-weight="600" text-anchor="middle">④ runAll 主循环</text>
+      <text x="500" y="394" fill="#9a7a55" font-size="9" text-anchor="middle">遍历 items · 实时进度 · 可「停止」</text>
+
+      <!-- N4 executeItem subprocess (apricot) -->
+      <rect x="310" y="442" width="380" height="150" rx="6" fill="#fdeede" stroke="#f0a868" stroke-width="1.5"/>
+      <text x="500" y="467" fill="#c47d35" font-size="12" font-weight="600" text-anchor="middle">⑤ executeItem · 单条加购</text>
+      <line x1="326" y1="476" x2="674" y2="476" stroke="#f0a868" stroke-width="0.5" opacity="0.4"/>
+      <text x="328" y="498" fill="#7a5a3a" font-size="10">1. 导航商品页  pid.SKU  (防循环 ×3)</text>
+      <text x="328" y="519" fill="#7a5a3a" font-size="10">2. Cloudflare 验证检测  (重试 ×5)</text>
+      <text x="328" y="540" fill="#7a5a3a" font-size="10">3. 等待页面就绪  (无按钮 = 缺货)</text>
+      <text x="328" y="561" fill="#7a5a3a" font-size="10">4. UPC 校验  (多规格 → 弹窗选规格匹配)</text>
+      <text x="328" y="582" fill="#7a5a3a" font-size="10">5. setQty 设数量 → 点击加购 → 成功弹窗 → 关闭</text>
+
+      <!-- D2 result decision (rose) -->
+      <polygon points="500,622 600,667 500,712 400,667" fill="#fce4ec" stroke="#ef8aa9" stroke-width="1.5"/>
+      <text x="500" y="662" fill="#c45a7e" font-size="11" font-weight="600" text-anchor="middle">⑥ 结果判定</text>
+      <text x="392" y="700" fill="#f0a868" font-size="8.5" text-anchor="end">重试 ≤2 ↺</text>
+      <text x="608" y="700" fill="#9b8bd4" font-size="8.5" text-anchor="start">导航中 → 续跑</text>
+      <text x="500" y="730" fill="#a87a8a" font-size="8.5" text-anchor="middle">成功 / 缺货 / 失败 ↓</text>
+
+      <!-- N5 persistence (lavender) -->
+      <rect x="310" y="742" width="380" height="80" rx="6" fill="#ece7fb" stroke="#9b8bd4" stroke-width="1.5"/>
+      <text x="500" y="768" fill="#6f5fb0" font-size="12" font-weight="600" text-anchor="middle">⑦ 实时落盘 &amp; 断点</text>
+      <text x="500" y="788" fill="#8378a8" font-size="9" text-anchor="middle">STORE.setWithRetry(results)</text>
+      <text x="500" y="806" fill="#8378a8" font-size="9" text-anchor="middle">空间不足 → 腾空间重试 → 抢救已加购</text>
+
+      <!-- D3 complete decision (rose) -->
+      <polygon points="500,852 600,897 500,942 400,897" fill="#fce4ec" stroke="#ef8aa9" stroke-width="1.5"/>
+      <text x="500" y="892" fill="#c45a7e" font-size="11" font-weight="600" text-anchor="middle">⑧ 全部完成?</text>
+      <text x="392" y="900" fill="#d96a8a" font-size="8.5" text-anchor="end">否 ↺ 下一条</text>
+      <text x="608" y="900" fill="#9a8f99" font-size="8.5" text-anchor="start">是 ↓</text>
+
+      <!-- N6 download excel (soft blue) -->
+      <rect x="310" y="962" width="380" height="90" rx="6" fill="#e8eef7" stroke="#7d9bc4" stroke-width="1.5"/>
+      <text x="500" y="988" fill="#4a6a92" font-size="12" font-weight="600" text-anchor="middle">⑨ 下载结果 Excel</text>
+      <text x="500" y="1008" fill="#6a7c96" font-size="9" text-anchor="middle">回写 备注 / 整箱批发价 / 加购结果</text>
+      <text x="500" y="1026" fill="#6a7c96" font-size="9" text-anchor="middle">排序 · 导出 xlsx  (可再导入断点续跑)</text>
+
+      <!-- N7 end (teal) -->
+      <rect x="350" y="1082" width="300" height="58" rx="29" fill="#e0f7f4" stroke="#5ec4b6" stroke-width="1.5"/>
+      <text x="500" y="1106" fill="#2c7a70" font-size="12" font-weight="600" text-anchor="middle">⑩ 完成通知</text>
+      <text x="500" y="1126" fill="#6b8f8a" font-size="9" text-anchor="middle">汇总 成功/失败/缺货 · notifyComplete</text>
+
+      <!-- navigating note (lavender) -->
+      <rect x="716" y="640" width="210" height="52" rx="6" fill="#f1ecfc" stroke="#9b8bd4" stroke-width="1.2" stroke-dasharray="4,4"/>
+      <text x="821" y="662" fill="#6f5fb0" font-size="9" font-weight="600" text-anchor="middle">导航中分支</text>
+      <text x="821" y="680" fill="#8378a8" font-size="8.5" text-anchor="middle">存 pending → 刷新页面</text>
+      <text x="821" y="694" fill="#8378a8" font-size="8.5" text-anchor="middle">→ ③ 自动续跑</text>
+    </svg>
+  </div>
+
+  <div class="legend">
+    <div class="legend-item"><span class="legend-swatch" style="background:#e0f7f4;border:1px solid #5ec4b6;"></span>用户输入 / 结束</div>
+    <div class="legend-item"><span class="legend-swatch" style="background:#e3f6e5;border:1px solid #6cc47f;"></span>解析 / 批次</div>
+    <div class="legend-item"><span class="legend-swatch" style="background:#fdeede;border:1px solid #f0a868;"></span>执行循环</div>
+    <div class="legend-item"><span class="legend-swatch" style="background:#fce4ec;border:1px solid #ef8aa9;"></span>判定 / 决策</div>
+    <div class="legend-item"><span class="legend-swatch" style="background:#ece7fb;border:1px solid #9b8bd4;"></span>持久化 / 续跑</div>
+    <div class="legend-item"><span class="legend-swatch" style="background:#e8eef7;border:1px solid #7d9bc4;"></span>输出</div>
+  </div>
+
+  <div class="cards">
+    <div class="card">
+      <div class="card-header"><div class="card-dot" style="background:#6cc47f;"></div><h3>输入与批次</h3></div>
+      <ul>
+        <li>上传采购 Excel（BoxSKU/SKU/数量/包装）</li>
+        <li>startNewBatch 生成唯一 runId 批次</li>
+        <li>mergeSameSku 同 SKU 合并、数量求和</li>
+        <li>刷新/跳页后按 pending/results 断点恢复</li>
+      </ul>
+    </div>
+    <div class="card">
+      <div class="card-header"><div class="card-dot" style="background:#f0a868;"></div><h3>执行核心</h3></div>
+      <ul>
+        <li>导航 pid.SKU（防循环 ×3 保险）</li>
+        <li>Cloudflare 验证检测（持久计数 ×5）</li>
+        <li>UPC 校验 / 多规格弹窗选规格匹配</li>
+        <li>失败重试 ≤2；无按钮判缺货</li>
+      </ul>
+    </div>
+    <div class="card">
+      <div class="card-header"><div class="card-dot" style="background:#9b8bd4;"></div><h3>持久化与输出</h3></div>
+      <ul>
+        <li>每条完成 STORE.setWithRetry 实时落盘</li>
+        <li>导航中存 pending，新页面自动续跑</li>
+        <li>空间不足自动腾空间抢救进度</li>
+        <li>结果 Excel 回写导出（可再导入续跑）</li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="footer">ABW Auto Purchase · content.js business flow · generated 2026-09-20</div>
+</div>
+
+<script>
+  const tbToggle = document.getElementById('tb-toggle');
+  const tbActions = document.getElementById('tb-actions');
+  tbToggle.addEventListener('click', () => tbActions.classList.toggle('show'));
+  document.addEventListener('click', (e) => {
+    if (!e.target.closest('.toolbar')) tbActions.classList.remove('show');
+  });
+
+  function captureRect() {
+    const el = document.getElementById('report-container');
+    const r = el.getBoundingClientRect();
+    return { x: r.x, y: r.y, width: r.width, height: r.height };
+  }
+  async function copyAsImage() {
+    const { x, y, width, height } = captureRect();
+    const canvas = await html2canvas(document.body, { x, y, width, height, backgroundColor: '#fbf9f4', scale: 2, ignoreElements: (n) => n.classList && n.classList.contains('toolbar') });
+    canvas.toBlob(async (blob) => {
+      try { await navigator.clipboard.write([new ClipboardItem({ 'image/png': blob })]); } catch (e) { alert('复制失败，请使用下载'); }
+    });
+  }
+  async function downloadPNG() {
+    const { x, y, width, height } = captureRect();
+    const canvas = await html2canvas(document.body, { x, y, width, height, backgroundColor: '#fbf9f4', scale: 2, ignoreElements: (n) => n.classList && n.classList.contains('toolbar') });
+    const a = document.createElement('a');
+    a.download = 'abw_auto_purchase_flow.png';
+    a.href = canvas.toDataURL('image/png');
+    a.click();
+  }
+  async function downloadPDF() {
+    const { x, y, width, height } = captureRect();
+    const canvas = await html2canvas(document.body, { x, y, width, height, backgroundColor: '#fbf9f4', scale: 2, ignoreElements: (n) => n.classList && n.classList.contains('toolbar') });
+    const img = canvas.toDataURL('image/png');
+    const { jsPDF } = window.jspdf;
+    const pdf = new jsPDF({ orientation: 'portrait', unit: 'px', format: [width, height] });
+    pdf.addImage(img, 'PNG', 0, 0, width, height);
+    pdf.save('abw_auto_purchase_flow.pdf');
+  }
+</script>
+</body>
+</html>
